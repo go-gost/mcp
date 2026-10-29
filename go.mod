@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/go-gost/x v0.27.3
+	golang.org/x/net v0.58.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
