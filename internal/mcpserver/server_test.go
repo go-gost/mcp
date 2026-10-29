@@ -17,12 +17,14 @@ import (
 
 // testConfig returns the profile set used by most tests: an explicit direct
 // egress and a proxy egress whose address cannot be reached. Tests that need to
-// make a request build their own profile pointing at a local proxy.
+// make a request build their own profile pointing at a local proxy. The proxy
+// chain URI carries userinfo so the default profiles exercise the credential
+// path too; gost moves it into the connector auth and never into node.Addr.
 func testConfig() *config.Config {
 	return &config.Config{
 		Egress: []config.EgressProfile{
 			{Name: "direct", Description: "Host direct, no proxy", Chain: []string{}},
-			{Name: "jp", Description: "Tokyo residential exit", Chain: []string{"socks5://tokyo.example.com:1080"}},
+			{Name: "jp", Description: "Tokyo residential exit", Chain: []string{"socks5://alice:hunter2@tokyo.example.com:1080"}},
 		},
 		Run: config.RunConfig{
 			Timeout:  5 * time.Second,
@@ -348,6 +350,89 @@ func TestEgressResourceExposesTopology(t *testing.T) {
 	}
 	if strings.Contains(text, "socks5://") {
 		t.Errorf("exposed topology still leaks a chain URI:\n%s", text)
+	}
+	for _, credential := range []string{"alice", "hunter2"} {
+		if strings.Contains(text, credential) {
+			t.Errorf("exposed topology leaks chain userinfo %q:\n%s", credential, text)
+		}
+	}
+}
+
+// credentialConfig loads the fixture whose profiles embed userinfo in a chain
+// URI and in hand-written hop node addresses.
+func credentialConfig(t *testing.T) *config.Config {
+	t.Helper()
+	cfg, err := config.Load("testdata/credentials.yml")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
+}
+
+// TestEgressResourceStripsCredentials is the regression test for the topology
+// path: the resource may name the host, but never the userinfo of a chain URI
+// or of a hand-written hop node address.
+func TestEgressResourceStripsCredentials(t *testing.T) {
+	for _, expose := range []bool{false, true} {
+		name := "without topology"
+		if expose {
+			name = "with topology"
+		}
+		t.Run(name, func(t *testing.T) {
+			cs := newTestSession(t, credentialConfig(t), expose)
+
+			res, err := cs.ReadResource(context.Background(), &mcp.ReadResourceParams{URI: "gost-mcp://egress"})
+			if err != nil {
+				t.Fatalf("ReadResource: %v", err)
+			}
+			if len(res.Contents) != 1 {
+				t.Fatalf("contents = %d, want 1", len(res.Contents))
+			}
+			text := res.Contents[0].Text
+
+			for _, credential := range []string{"alice", "hunter2", "bob", "carol", "s3cret"} {
+				if strings.Contains(text, credential) {
+					t.Errorf("resource leaks credential %q:\n%s", credential, text)
+				}
+			}
+
+			// Without --expose-topology the payload is name + description only,
+			// so no address is emitted at all; with it, the host survives.
+			for _, host := range []string{"tokyo.example.com", "osaka.example.com", "nagoya.example.com"} {
+				if got := strings.Contains(text, host); got != expose {
+					t.Errorf("contains(%q) = %v, want %v (--expose-topology = %v):\n%s",
+						host, got, expose, expose, text)
+				}
+			}
+		})
+	}
+}
+
+func TestStripUserInfo(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"scheme with credentials", "socks5://user:pass@host:1080", "socks5://host:1080"},
+		{"scheme-less with credentials", "user:pass@host:8080", "host:8080"},
+		{"scheme-less without password", "user@host:8080", "host:8080"},
+		{"scheme-less without port", "user:pass@host", "host"},
+		{"escaped separator", "socks5://user:p%40ss@host:1080", "socks5://host:1080"},
+		{"ipv6 host", "socks5://user:pass@[::1]:1080", "socks5://[::1]:1080"},
+		{"no credentials", "host:8080", "host:8080"},
+		{"scheme without credentials", "socks5://host:1080", "socks5://host:1080"},
+		{"empty", "", ""},
+		{"at in path is not credentials", "http://host:8080/a@b", "http://host:8080/a@b"},
+		{"at in query is not credentials", "socks5://host:1080?auth=a@b", "socks5://host:1080?auth=a@b"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripUserInfo(tt.in); got != tt.want {
+				t.Errorf("stripUserInfo(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 

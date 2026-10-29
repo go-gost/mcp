@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/go-gost/x/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -85,11 +86,29 @@ func nodeResources(hops []*config.HopConfig) []egressNode {
 }
 
 // stripUserInfo removes credentials from an address when one is embedded.
+//
+// A scheme-qualified address (socks5://user:pass@host:1080) parses with a User
+// and is rebuilt without it. A scheme-less address (user:pass@host:1080) parses
+// as the scheme "user" with an opaque part, so User is nil and the string would
+// otherwise pass through untouched; for those the authority is scanned for the
+// last "@" instead. Only the authority is considered, so an "@" inside a path
+// or query is left alone.
 func stripUserInfo(addr string) string {
-	u, err := url.Parse(addr)
-	if err != nil || u.User == nil {
-		return addr
+	if u, err := url.Parse(addr); err == nil && u.User != nil {
+		u.User = nil
+		return u.String()
 	}
-	u.User = nil
-	return u.String()
+
+	rest := addr
+	if i := strings.Index(addr, "://"); i >= 0 {
+		rest = addr[i+3:]
+	}
+	authority, tail := rest, ""
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		authority, tail = rest[:j], rest[j:]
+	}
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		return authority[at+1:] + tail
+	}
+	return addr
 }
