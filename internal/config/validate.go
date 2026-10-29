@@ -206,6 +206,9 @@ func rejectMetadata(where string, md map[string]any) error {
 }
 
 func isForbiddenKey(key string) bool {
+	// gost lowercases metadata keys before reading them (mdx.NewMetadata), so
+	// the check must be case-insensitive or ?BYPASS=xx would slip through.
+	key = strings.ToLower(key)
 	key = strings.TrimPrefix(strings.TrimPrefix(key, "hop."), "node.")
 	for _, k := range forbiddenKeys {
 		if key == k {
