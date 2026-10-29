@@ -18,6 +18,24 @@ import (
 // that traffic actually went through the proxy instead of dialing directly.
 func NewHTTPProxy(t *testing.T, denyTargets ...string) string {
 	t.Helper()
+	return startProxy(t, "", denyTargets)
+}
+
+// NewHTTPProxyRewriting starts a CONNECT-only HTTP proxy that connects every
+// target to rewriteTo instead of the address in the CONNECT request.
+//
+// It lets a test prove the exit resolves the target name: the request can use
+// a host that cannot resolve locally while the proxy forwards it to a local
+// server.
+func NewHTTPProxyRewriting(t *testing.T, rewriteTo string) string {
+	t.Helper()
+	return startProxy(t, rewriteTo, nil)
+}
+
+// startProxy serves CONNECT on a loopback port. An empty rewriteTo connects to
+// the requested target.
+func startProxy(t *testing.T, rewriteTo string, denyTargets []string) string {
+	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -41,7 +59,7 @@ func NewHTTPProxy(t *testing.T, denyTargets ...string) string {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				serveCONNECT(conn, deny)
+				serveCONNECT(conn, rewriteTo, deny)
 			}()
 		}
 	}()
@@ -56,7 +74,7 @@ func NewHTTPProxy(t *testing.T, denyTargets ...string) string {
 
 // serveCONNECT handles one client: it reads the CONNECT request, dials the
 // target, reports success, and then relays bytes in both directions.
-func serveCONNECT(conn net.Conn, deny map[string]bool) {
+func serveCONNECT(conn net.Conn, rewriteTo string, deny map[string]bool) {
 	defer conn.Close()
 
 	br := bufio.NewReader(conn)
@@ -73,12 +91,16 @@ func serveCONNECT(conn net.Conn, deny map[string]bool) {
 		return
 	}
 
-	target, err := net.Dial("tcp", req.Host)
+	target := req.Host
+	if rewriteTo != "" {
+		target = rewriteTo
+	}
+	upstream, err := net.Dial("tcp", target)
 	if err != nil {
 		writeStatus(conn, http.StatusBadGateway)
 		return
 	}
-	defer target.Close()
+	defer upstream.Close()
 
 	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
@@ -88,11 +110,11 @@ func serveCONNECT(conn net.Conn, deny map[string]bool) {
 	// and the buffered reader keeps any payload read together with the request.
 	done := make(chan struct{}, 2)
 	go func() {
-		io.Copy(target, br)
+		io.Copy(upstream, br)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(conn, target)
+		io.Copy(conn, upstream)
 		done <- struct{}{}
 	}()
 	<-done
