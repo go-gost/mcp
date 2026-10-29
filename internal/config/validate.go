@@ -19,6 +19,11 @@ var namePattern = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 // dial. In an egress-only tool that is a hidden bypass, so they are rejected.
 var forbiddenKeys = []string{"bypass", "bypasses", "matcher", "filter"}
 
+// forbiddenChainParams are named components that BuildConfigFromCmd turns into
+// file-level resolvers/hosts. This config has no place for them, so a chain URI
+// asking for one would silently resolve to nothing; rejecting it is clearer.
+var forbiddenChainParams = []string{"resolver", "hosts", "sd"}
+
 // Validate checks the whole file: file-level settings and every profile.
 func (c *Config) Validate() error {
 	if err := c.validateFile(); err != nil {
@@ -159,6 +164,9 @@ func validateChain(profile string, chain []string) error {
 			if isForbiddenKey(key) {
 				return fmt.Errorf("config: egress %q: chain[%d]: query parameter %q is not allowed in an egress profile", profile, i, key)
 			}
+			if isForbiddenChainParam(key) {
+				return fmt.Errorf("config: egress %q: chain[%d]: query parameter %q cannot be carried by an egress profile", profile, i, key)
+			}
 		}
 	}
 	return nil
@@ -206,14 +214,29 @@ func rejectMetadata(where string, md map[string]any) error {
 }
 
 func isForbiddenKey(key string) bool {
-	// gost lowercases metadata keys before reading them (mdx.NewMetadata), so
-	// the check must be case-insensitive or ?BYPASS=xx would slip through.
-	key = strings.ToLower(key)
-	key = strings.TrimPrefix(strings.TrimPrefix(key, "hop."), "node.")
+	key = normalizeKey(key)
 	for _, k := range forbiddenKeys {
 		if key == k {
 			return true
 		}
 	}
 	return false
+}
+
+func isForbiddenChainParam(key string) bool {
+	key = normalizeKey(key)
+	for _, k := range forbiddenChainParams {
+		if key == k {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeKey lowercases and strips the hop./node. prefixes: gost lowercases
+// metadata keys before reading them (mdx.NewMetadata), so the checks must be
+// case-insensitive or ?BYPASS=xx would slip through.
+func normalizeKey(key string) string {
+	key = strings.ToLower(key)
+	return strings.TrimPrefix(strings.TrimPrefix(key, "hop."), "node.")
 }

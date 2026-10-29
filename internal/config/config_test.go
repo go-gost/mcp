@@ -228,6 +228,38 @@ func TestValidateRejectsBypass(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsDroppedNamedComponents covers chain query parameters
+// that ChainConfig drops (they become file-level resolvers/hosts, which an
+// egress-only profile cannot carry), so accepting them would silently resolve
+// to nothing.
+func TestValidateRejectsDroppedNamedComponents(t *testing.T) {
+	chain := func(uri string) EgressProfile {
+		p := validProfile("jp")
+		p.Chain = []string{uri}
+		return p
+	}
+
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{"resolver", "socks5://proxy.example.com:1080?resolver=r1"},
+		{"hosts", "socks5://proxy.example.com:1080?hosts=h1"},
+		{"sd", "socks5://proxy.example.com:1080?sd=s1"},
+		{"uppercase resolver", "socks5://proxy.example.com:1080?RESOLVER=r1"},
+		{"node-prefixed resolver", "socks5://proxy.example.com:1080?node.resolver=r1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Egress: []EgressProfile{chain(tt.uri)}}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsBadNames(t *testing.T) {
 	tests := []struct {
 		name     string
