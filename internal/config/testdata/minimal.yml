@@ -1,0 +1,4 @@
+egress:
+  - name: direct
+    description: "Host direct, no proxy"
+    chain: []

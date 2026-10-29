@@ -1,0 +1,11 @@
+# Binaries
+/gost-mcp
+/dist/
+
+# Test artifacts
+*.test
+coverage.out
+
+# Local configuration: may contain credentials
+gost-mcp.yml
+.gost-mcp/

@@ -1,0 +1,10 @@
+# A gost section that gost-mcp deliberately rejects: profiles are the only
+# supported egress source, services would imply running a gost server here.
+services:
+  - name: svc
+    handler: http
+    listener: tcp
+egress:
+  - name: direct
+    description: "Host direct, no proxy"
+    chain: []
