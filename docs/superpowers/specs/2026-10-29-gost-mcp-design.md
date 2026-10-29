@@ -30,9 +30,9 @@ It is **not** a gost control plane: it does not read, write, reload, or observe 
 
 | ID | Goal |
 |----|------|
-| G1 | `gost_run`: send one HTTP(S) request through a named egress; return status, headers, body, per-stage timings, and a classified failure. |
-| G2 | `gost_trace`: diagnose DNS/TCP/TLS/HTTP/UDP reachability through an egress, attribute the failure to the first failing chain prefix, optionally report the public egress identity. |
-| G3 | `gost_wisp`: publish a loopback HTTP service at `https://<label>.gost.run` for a bounded TTL; `gost_unwisp` releases it early. |
+| G1 | `gost-run`: send one HTTP(S) request through a named egress; return status, headers, body, per-stage timings, and a classified failure. |
+| G2 | `gost-trace`: diagnose DNS/TCP/TLS/HTTP/UDP reachability through an egress, attribute the failure to the first failing chain prefix, optionally report the public egress identity. |
+| G3 | `gost-wisp`: publish a loopback HTTP service at `https://<label>.gost.run` for a bounded TTL; `gost-unwisp` releases it early. |
 | G4 | Local `gost-mcp.yml` with gost-compatible chain/hop schema, `${ENV}` expansion, startup validation, and a model-visible catalog that contains names and descriptions only. |
 | G5 | Single binary, stdio transport, works with no other gost component present. |
 
@@ -71,14 +71,14 @@ These are failure modes even if the code works:
 
 | Tool | Purpose | Annotations |
 |------|---------|-------------|
-| `gost_run` | One HTTP(S) request through an egress profile | `readOnlyHint=false` (may POST), `destructiveHint=false`, `openWorldHint=true` |
-| `gost_trace` | Staged connectivity diagnosis through an egress | `readOnlyHint=true`, `openWorldHint=true` |
-| `gost_wisp` | Publish a loopback HTTP service; returns a lease handle | `readOnlyHint=false`, `destructiveHint=false`, `openWorldHint=true` |
-| `gost_unwisp` | Release a lease early | `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=true` |
+| `gost-run` | One HTTP(S) request through an egress profile | `readOnlyHint=false` (may POST), `destructiveHint=false`, `openWorldHint=true` |
+| `gost-trace` | Staged connectivity diagnosis through an egress | `readOnlyHint=true`, `openWorldHint=true` |
+| `gost-wisp` | Publish a loopback HTTP service; returns a lease handle | `readOnlyHint=false`, `destructiveHint=false`, `openWorldHint=true` |
+| `gost-unwisp` | Release a lease early | `readOnlyHint=false`, `destructiveHint=false`, `idempotentHint=true` |
 
-The names are deliberately opaque product verbs; each description opens with one full sentence stating what it does and that it goes *through an egress profile*, because the name alone does not say "proxy". `gost_trace` in particular must say it traces **cumulative chain prefixes**, not per-hop TTL hops, so the name does not overpromise a traceroute.
+The names are deliberately opaque product verbs; each description opens with one full sentence stating what it does and that it goes *through an egress profile*, because the name alone does not say "proxy". `gost-trace` in particular must say it traces **cumulative chain prefixes**, not per-hop TTL hops, so the name does not overpromise a traceroute.
 
-### 7.1 `gost_run`
+### 7.1 `gost-run`
 
 Input:
 
@@ -126,7 +126,7 @@ Rules:
 - Transport failures return `ok=false` with a `failure` object (see §9); they are not MCP protocol errors.
 - Only headers on an allowlist are echoed (`content-type`, `content-length`, `server`, `location`, `content-encoding`, `retry-after`, plus any `x-*` up to a cap) to keep the output small.
 
-### 7.2 `gost_trace`
+### 7.2 `gost-trace`
 
 Input:
 
@@ -178,14 +178,14 @@ Rules:
 - `udp` requires a UDP-capable egress; the tool attempts the exchange and maps known "proxy cannot do UDP" errors to `code=unsupported` instead of a timeout. It does not precompute capability from the scheme.
 - `identity` performs one HTTPS request through the full chain to `trace.identity_url` and reports `{ip, family, country, asn, org}` when the endpoint provides them. It is charged against the same budget.
 
-### 7.3 `gost_wisp` / `gost_unwisp`
+### 7.3 `gost-wisp` / `gost-unwisp`
 
-`gost_wisp` input:
+`gost-wisp` input:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `local` | string | required | must resolve into `gost_wisp.allow` (default `127.0.0.0/8`, `::1/128`) |
-| `ttl_s` | int | 900 | capped by `gost_wisp.max_ttl` (default 3600) |
+| `local` | string | required | must resolve into `gost-wisp.allow` (default `127.0.0.0/8`, `::1/128`) |
+| `ttl_s` | int | 900 | capped by `gost-wisp.max_ttl` (default 3600) |
 | `label` | string | `""` | free text for logs and lease listing |
 | `verify` | bool | true | one GET through the public URL after publish |
 
@@ -206,7 +206,7 @@ Output:
 Rules:
 
 - Implementation: build the same service that `gost -L rtcp://:0/<local> -F tunnel+wss://<relay>` produces (via `cmd.BuildConfigFromCmd`, chain registered under a per-lease name), start `Serve()`, then poll `Addr()` until the negotiated public host appears (timeout 15 s). No log parsing.
-- `url = https://<host>.<gost_wisp.domain>` where `gost_wisp.domain` defaults to `gost.run`.
+- `url = https://<host>.<gost-wisp.domain>` where `gost-wisp.domain` defaults to `gost.run`.
 - `local` is a `host:port`; the host may be an IP literal or a DNS name such as `localhost`. It is resolved once, every address must be allowed, and the first IPv4 address (else the first IPv6) is pinned.
 - Lease lives in an in-memory map guarded by a mutex; a reaper closes the service at TTL; process exit closes all leases. `max_leases` (default 4) bounds concurrency.
 - The handle is 16 lowercase hex characters, opaque, random, and not derived from the public label.
@@ -216,7 +216,7 @@ Rules:
 - States are `active`, `rebound`, `expired`, and `dead`.
 - The tool description states plainly: the URL is public and unauthenticated; the local service must authenticate its own users.
 
-`gost_unwisp` input: `{"handle": "..."}`; output `{"ok": true, "released": true, "url": "..."}`. Idempotent: releasing an unknown or expired handle returns `released=false`, not an error.
+`gost-unwisp` input: `{"handle": "..."}`; output `{"ok": true, "released": true, "url": "..."}`. Idempotent: releasing an unknown or expired handle returns `released=false`, not an error.
 
 ## 8. Configuration
 
@@ -251,15 +251,15 @@ egress:
     chain:
       - "socks5://192.168.1.10:1080?interface=wlan0"
 
-gost_run:
+gost-run:
   timeout: 30s
   max_bytes: 1MiB
 
-gost_trace:
+gost-trace:
   timeout: 10s
   identity_url: "https://ifconfig.co/json"
 
-gost_wisp:
+gost-wisp:
   relay: "tunnel+wss://wisper.gost.run:443"
   domain: "gost.run"
   max_ttl: 1h
@@ -293,7 +293,7 @@ One struct, used by every tool:
 
 Stages: `config`, `policy`, `resolve`, `connect`, `proxy_auth`, `tls`, `http`, `read`, `timeout`, `canceled`, `internal`.
 
-Codes are stable strings (`timeout`, `refused`, `nxdomain`, `no_route`, `proxy_auth_failed`, `tls_handshake`, `tls_verify`, `unsupported`, `truncated`, `canceled`, …). `gost_run`/`gost_trace` return `ok=false` with this object as structured content and `isError=false`; MCP protocol errors are reserved for invalid arguments and internal faults.
+Codes are stable strings (`timeout`, `refused`, `nxdomain`, `no_route`, `proxy_auth_failed`, `tls_handshake`, `tls_verify`, `unsupported`, `truncated`, `canceled`, …). `gost-run`/`gost-trace` return `ok=false` with this object as structured content and `isError=false`; MCP protocol errors are reserved for invalid arguments and internal faults.
 
 ## 10. Architecture
 
@@ -322,7 +322,7 @@ mcp/
 - The server is a network tool running with the operator's network identity, not a sandbox. This is stated in the README.
 - No implicit direct egress; no URI-valued `egress` argument.
 - No `env:` header indirection in v0: it would let a prompt-injected model exfiltrate a server-side secret to an arbitrary host. Header values are literal and therefore visible to the model; this is documented.
-- `gost_wisp` is loopback-only by default, TTL-capped, lease-capped, logged (label, target, URL, handle, expiry), and never relays to a model-chosen relay.
+- `gost-wisp` is loopback-only by default, TTL-capped, lease-capped, logged (label, target, URL, handle, expiry), and never relays to a model-chosen relay.
 - Config may contain credentials: `--check` warns when the file is group/world readable; README recommends 0600 and MCP-client env injection for secrets.
 - stdout is the MCP channel; gost-mcp's own diagnostics go to stderr or `log.file`. Embedded gost components keep their own logger.
 - No shell execution, no config editing, no file paths from tool arguments (except none are accepted).
@@ -338,8 +338,8 @@ mcp/
 
 ## 13. Rollout
 
-1. Skeleton: config, `--check`, MCP server, `gost_run`, `gost_trace`.
-2. `gost_wisp` / `gost_unwisp` with the lease reaper and the fake provisioner test.
+1. Skeleton: config, `--check`, MCP server, `gost-run`, `gost-trace`.
+2. `gost-wisp` / `gost-unwisp` with the lease reaper and the fake provisioner test.
 3. Docs: README, examples for Claude Code / OpenCode / Codex, Dockerfile, goreleaser, one worked diagnosis example.
 
 Version stays `v0.x` until the tool schemas have been exercised by real agents.
@@ -349,22 +349,22 @@ Version stays `v0.x` until the tool schemas have been exercised by real agents.
 Made with the user:
 
 - Repository `go-gost/mcp`; single binary; in-process `x/`; no daemon.
-- Tool names: `gost_run`, `gost_trace`, `gost_wisp`; `gost_` prefix.
+- Tool names: `gost-run`, `gost-trace`, `gost-wisp`; `gost_` prefix.
 - Local profile file only, no remote distribution, no hot reload.
 - Session-scoped tunnels; no public TCP/UDP; stdio only in v0.
 
 My calls (veto freely):
 
 - **No `x/` changes in v0.** Prefix attribution is best-effort by re-parsing and re-dialing; an empty route is rejected before dialing; profiles may not use bypass/matcher. If exact attribution ever needs an `x` API, it becomes a separately released `core → x → mcp` change.
-- `gost_unwisp` exists despite the three-name list: a published URL should be revocable before TTL.
+- `gost-unwisp` exists despite the three-name list: a published URL should be revocable before TTL.
 - `egress` is required everywhere; `direct` must be declared explicitly.
 - No `env:` secret indirection in v0.
-- `gost_wisp` is loopback-only by default; widening is config-only.
+- `gost-wisp` is loopback-only by default; widening is config-only.
 - Prefix probing connects only; the full stage test runs once on the full chain.
-- `gost_trace` timeout is a single budget for the whole call and may return partial results.
+- `gost-trace` timeout is a single budget for the whole call and may return partial results.
 - `mode=dns` queries the first nameserver from `/etc/resolv.conf` through the egress by default; `resolver` overrides it. No public resolver is hardcoded.
 - Output includes node **names** (`served_by`) but never addresses.
-- `gost_run` has no `resolve_ms`; the chain's resolution is inside `connect_ms`.
+- `gost-run` has no `resolve_ms`; the chain's resolution is inside `connect_ms`.
 - A wisp lease watches for relay re-binds and reports the new URL via `gost-mcp://leases`.
 - Identity lookup defaults to `ifconfig.co/json`, is opt-in per call, and is configurable.
 

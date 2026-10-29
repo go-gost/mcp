@@ -1,5 +1,5 @@
 // Command gost-mcp is a stdio MCP server exposing gost as three network
-// primitives: gost_run, gost_trace, and gost_wisp/gost_unwisp.
+// primitives: gost-run, gost-trace, and gost-wisp/gost-unwisp.
 //
 // stdout is the MCP channel. Everything else, including warnings, goes to
 // stderr.

@@ -15,12 +15,12 @@ import (
 
 const (
 	// defaultWispTTL is the lease lifetime when the caller omits ttl_s. The
-	// provisioner still clamps it to gost_wisp.max_ttl.
+	// provisioner still clamps it to gost-wisp.max_ttl.
 	defaultWispTTL = 900 * time.Second
 
 	// maxWispTTL bounds the tool argument before the conversion to
 	// time.Duration can overflow. config validation already caps
-	// gost_wisp.max_ttl at 24h, so this never shortens a configured lease.
+	// gost-wisp.max_ttl at 24h, so this never shortens a configured lease.
 	maxWispTTL = 24 * time.Hour
 
 	// maxWispLabel caps the free-text label so a model cannot grow the lease
@@ -28,11 +28,11 @@ const (
 	maxWispLabel = 128
 )
 
-// wispInput is the gost_wisp tool schema. Local is required; ttl_s and verify
+// wispInput is the gost-wisp tool schema. Local is required; ttl_s and verify
 // default to the spec values when omitted.
 type wispInput struct {
-	Local  string `json:"local" jsonschema:"loopback target to publish as host:port, such as 127.0.0.1:3000; it must resolve inside the configured gost_wisp.allow list"`
-	TTLS   int64  `json:"ttl_s,omitempty" jsonschema:"lease lifetime in seconds; defaults to 900 and is capped by gost_wisp.max_ttl"`
+	Local  string `json:"local" jsonschema:"loopback target to publish as host:port, such as 127.0.0.1:3000; it must resolve inside the configured gost-wisp.allow list"`
+	TTLS   int64  `json:"ttl_s,omitempty" jsonschema:"lease lifetime in seconds; defaults to 900 and is capped by gost-wisp.max_ttl"`
 	Label  string `json:"label,omitempty" jsonschema:"free-text label for logs and the lease listing; never part of the public URL"`
 	Verify *bool  `json:"verify,omitempty" jsonschema:"request the public URL once after publishing; defaults to true"`
 }
@@ -50,9 +50,9 @@ type wispOutput struct {
 	Failure   *failure.Failure   `json:"failure,omitempty"`
 }
 
-// unwispInput is the gost_unwisp tool schema.
+// unwispInput is the gost-unwisp tool schema.
 type unwispInput struct {
-	Handle string `json:"handle" jsonschema:"lease handle returned by gost_wisp"`
+	Handle string `json:"handle" jsonschema:"lease handle returned by gost-wisp"`
 }
 
 // unwispOutput reports whether the handle owned a live lease. URL is the
@@ -63,16 +63,16 @@ type unwispOutput struct {
 	URL      string `json:"url"`
 }
 
-// wispTool describes gost_wisp. The description states the action and, plainly,
+// wispTool describes gost-wisp. The description states the action and, plainly,
 // that the published URL has no access control: the local service is exposed
 // to anyone who learns the URL.
 func wispTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: "gost_wisp",
+		Name: "gost-wisp",
 		Description: "Publish a loopback HTTP service at a public wisp URL for a bounded lease and return its handle. " +
 			"The URL is public and unauthenticated: anyone who learns it can reach the local service, so the local service must authenticate its own users. " +
-			"The target must resolve inside the configured gost_wisp.allow list (loopback by default), and ttl_s is capped by gost_wisp.max_ttl. " +
-			"Release it early with gost_unwisp; a relay may re-bind the tunnel, so read the current URL from the gost-mcp://leases resource. " +
+			"The target must resolve inside the configured gost-wisp.allow list (loopback by default), and ttl_s is capped by gost-wisp.max_ttl. " +
+			"Release it early with gost-unwisp; a relay may re-bind the tunnel, so read the current URL from the gost-mcp://leases resource. " +
 			"A publish failure is reported as ok=false with a failure object.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
@@ -82,11 +82,11 @@ func wispTool() *mcp.Tool {
 	}
 }
 
-// unwispTool describes gost_unwisp. The idempotency hint matches the behaviour:
+// unwispTool describes gost-unwisp. The idempotency hint matches the behaviour:
 // a second release reports released=false instead of failing.
 func unwispTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: "gost_unwisp",
+		Name: "gost-unwisp",
 		Description: "Release a wisp lease early and close its tunnel. " +
 			"It is idempotent: an unknown, expired, or already released handle returns released=false instead of an error. " +
 			"Read gost-mcp://leases to find the current handles and URLs.",
@@ -103,12 +103,12 @@ func unwispTool() *mcp.Tool {
 // runtime publish failure is a structured ok=false result.
 func (s *server) handleWisp(ctx context.Context, _ *mcp.CallToolRequest, in wispInput) (*mcp.CallToolResult, wispOutput, error) {
 	if s.deps.Wisp == nil {
-		return nil, wispOutput{}, fmt.Errorf("gost_wisp: publishing is not configured")
+		return nil, wispOutput{}, fmt.Errorf("gost-wisp: publishing is not configured")
 	}
 
 	local := strings.TrimSpace(in.Local)
 	if local == "" {
-		return nil, wispOutput{}, fmt.Errorf("gost_wisp: local is required")
+		return nil, wispOutput{}, fmt.Errorf("gost-wisp: local is required")
 	}
 
 	ttl, err := wispTTL(in.TTLS)
@@ -129,7 +129,7 @@ func (s *server) handleWisp(ctx context.Context, _ *mcp.CallToolRequest, in wisp
 	})
 	if err != nil {
 		if errors.Is(err, wisp.ErrTargetNotAllowed) || errors.Is(err, wisp.ErrInvalidTarget) {
-			return nil, wispOutput{}, fmt.Errorf("gost_wisp: %w", err)
+			return nil, wispOutput{}, fmt.Errorf("gost-wisp: %w", err)
 		}
 		return nil, wispOutput{OK: false, Failure: failure.Classify(err)}, nil
 	}
@@ -159,12 +159,12 @@ func (s *server) handleWisp(ctx context.Context, _ *mcp.CallToolRequest, in wisp
 // error: the caller learns that nothing was released from released=false.
 func (s *server) handleUnwisp(ctx context.Context, _ *mcp.CallToolRequest, in unwispInput) (*mcp.CallToolResult, unwispOutput, error) {
 	if s.deps.Wisp == nil {
-		return nil, unwispOutput{}, fmt.Errorf("gost_unwisp: publishing is not configured")
+		return nil, unwispOutput{}, fmt.Errorf("gost-unwisp: publishing is not configured")
 	}
 
 	handle := strings.TrimSpace(in.Handle)
 	if handle == "" {
-		return nil, unwispOutput{}, fmt.Errorf("gost_unwisp: handle is required")
+		return nil, unwispOutput{}, fmt.Errorf("gost-unwisp: handle is required")
 	}
 
 	lease, released := s.deps.Wisp.Release(ctx, handle)
@@ -187,7 +187,7 @@ func (s *server) handleUnwisp(ctx context.Context, _ *mcp.CallToolRequest, in un
 // TTL is an argument error, not a silent default.
 func wispTTL(seconds int64) (time.Duration, error) {
 	if seconds < 0 {
-		return 0, fmt.Errorf("gost_wisp: ttl_s must not be negative")
+		return 0, fmt.Errorf("gost-wisp: ttl_s must not be negative")
 	}
 	switch {
 	case seconds == 0:

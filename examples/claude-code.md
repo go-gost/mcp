@@ -51,7 +51,7 @@ If a variable is missing, the server exits at startup with `config: undefined en
 
 ## Worked prompts
 
-**Reach through an egress (`gost_run`)**
+**Reach through an egress (`gost-run`)**
 
 > Reach https://ifconfig.co through jp and show me the exit IP.
 
@@ -64,7 +64,7 @@ Claude calls:
 }
 ```
 
-**Diagnose a target (`gost_trace`)**
+**Diagnose a target (`gost-trace`)**
 
 > Trace example.com:443 through corp and tell me which chain prefix fails.
 
@@ -80,7 +80,7 @@ Claude calls:
 
 The answer names the first failing prefix, for example `hop-0 → hop-1`, stage `connect`, code `timeout`. `corp` is the multi-hop example profile from the README; use the name of a profile you actually configured.
 
-**Publish a local service (`gost_wisp`)**
+**Publish a local service (`gost-wisp`)**
 
 > Publish 127.0.0.1:3000 at a public URL for 10 minutes.
 
@@ -94,10 +94,10 @@ Claude calls:
 }
 ```
 
-It returns a URL and a handle such as `w_7f3c2a1b9d40`. A bare `:3000` is not accepted: `local` must include a host, and the address must resolve inside `gost_wisp.allow` (loopback by default).
+It returns a URL and a handle such as `w_7f3c2a1b9d40`. A bare `:3000` is not accepted: `local` must include a host, and the address must resolve inside `gost-wisp.allow` (loopback by default).
 
 To revoke early:
 
 > Release the lease you just created.
 
-Claude calls `gost_unwisp` with the handle. The URL is public and unauthenticated — the local service must authenticate its own users, and the lease ends when the TTL expires or the server process exits.
+Claude calls `gost-unwisp` with the handle. The URL is public and unauthenticated — the local service must authenticate its own users, and the lease ends when the TTL expires or the server process exits.

@@ -39,11 +39,11 @@ startup_timeout_sec = 20
 tool_timeout_sec = 120
 ```
 
-`gost-mcp` bounds every call internally (120 s for `gost_run`, 60 s for `gost_trace`), so the tool timeout only needs to cover the MCP round trip.
+`gost-mcp` bounds every call internally (120 s for `gost-run`, 60 s for `gost-trace`), so the tool timeout only needs to cover the MCP round trip.
 
 ## Worked prompts
 
-**Reach through an egress (`gost_run`)**
+**Reach through an egress (`gost-run`)**
 
 > Reach https://ifconfig.co through jp and show me the exit IP.
 
@@ -58,7 +58,7 @@ The tool call:
 
 A non-2xx status is still a successful call. Transport failures return `ok=false` with `stage`, `code`, `message`, and `retryable`.
 
-**Diagnose a target (`gost_trace`)**
+**Diagnose a target (`gost-trace`)**
 
 > Trace example.com:443 through corp and tell me which chain prefix fails.
 
@@ -74,7 +74,7 @@ The tool call:
 
 Codex gets the completed stages, the first failing cumulative prefix, and optionally the public egress identity (`ip`, `country`, `asn`, ...). `corp` is the multi-hop example profile from the README; use a profile you actually configured.
 
-**Publish a local service (`gost_wisp`)**
+**Publish a local service (`gost-wisp`)**
 
 > Publish 127.0.0.1:3000 at a public URL for 10 minutes.
 
@@ -88,10 +88,10 @@ The tool call:
 }
 ```
 
-The result carries `url`, `handle`, `expires_at`, and `state`. A bare `:3000` is rejected: `local` must include a host and must resolve inside `gost_wisp.allow` (loopback by default).
+The result carries `url`, `handle`, `expires_at`, and `state`. A bare `:3000` is rejected: `local` must include a host and must resolve inside `gost-wisp.allow` (loopback by default).
 
 To revoke early:
 
 > Release the lease you just created.
 
-Codex calls `gost_unwisp` with the handle. The URL is public and unauthenticated, so the local service must authenticate its own users, and the lease ends at TTL or when the server process exits.
+Codex calls `gost-unwisp` with the handle. The URL is public and unauthenticated, so the local service must authenticate its own users, and the lease ends at TTL or when the server process exits.

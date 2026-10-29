@@ -43,7 +43,7 @@ type Deps struct {
 	// Off by default: the model sees only names and descriptions.
 	ExposeTopology bool
 
-	// Wisp publishes local services for gost_wisp. A nil provisioner is
+	// Wisp publishes local services for gost-wisp. A nil provisioner is
 	// allowed: the wisp tools report that publishing is not configured and
 	// the gost-mcp://leases resource is empty.
 	Wisp wisp.Provisioner
@@ -81,8 +81,8 @@ func (s *server) logger() *slog.Logger {
 	return stderrLogger
 }
 
-// New builds the MCP server with gost_run, gost_trace, gost_wisp,
-// gost_unwisp, and the gost-mcp://egress and gost-mcp://leases resources
+// New builds the MCP server with gost-run, gost-trace, gost-wisp,
+// gost-unwisp, and the gost-mcp://egress and gost-mcp://leases resources
 // registered.
 func New(cfg *config.Config, deps Deps) *mcp.Server {
 	if cfg == nil {

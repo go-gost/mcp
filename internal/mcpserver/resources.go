@@ -39,7 +39,7 @@ func addEgressResource(srv *mcp.Server, s *server) {
 	srv.AddResource(&mcp.Resource{
 		URI:         egressResourceURI,
 		Name:        "egress",
-		Description: "Configured egress profiles. Each entry has a name and a description; pass the name to gost_run or gost_trace. Node addresses are shown only when the server was started with --expose-topology.",
+		Description: "Configured egress profiles. Each entry has a name and a description; pass the name to gost-run or gost-trace. Node addresses are shown only when the server was started with --expose-topology.",
 		MIMEType:    "application/json",
 	}, s.readEgressResource)
 }
@@ -147,7 +147,7 @@ func addLeasesResource(srv *mcp.Server, s *server) {
 		URI:  leasesResourceURI,
 		Name: "leases",
 		Description: "Live wisp leases and their current public URLs, with handle, local target, label, state, and expiry (RFC3339). " +
-			"Read this after a relay re-bind because gost_wisp's returned URL may be stale. " +
+			"Read this after a relay re-bind because gost-wisp's returned URL may be stale. " +
 			"Each URL is public and unauthenticated. Node addresses and credentials never appear here.",
 		MIMEType: "application/json",
 	}, s.readLeasesResource)

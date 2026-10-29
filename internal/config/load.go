@@ -266,10 +266,10 @@ func (c *RunConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	var err error
-	if c.Timeout, err = durationValue(raw.Timeout, "gost_run.timeout"); err != nil {
+	if c.Timeout, err = durationValue(raw.Timeout, "gost-run.timeout"); err != nil {
 		return err
 	}
-	if c.MaxBytes, err = byteValue(raw.MaxBytes, "gost_run.max_bytes"); err != nil {
+	if c.MaxBytes, err = byteValue(raw.MaxBytes, "gost-run.max_bytes"); err != nil {
 		return err
 	}
 	return nil
@@ -287,7 +287,7 @@ func (c *TraceConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	var err error
-	if c.Timeout, err = durationValue(raw.Timeout, "gost_trace.timeout"); err != nil {
+	if c.Timeout, err = durationValue(raw.Timeout, "gost-trace.timeout"); err != nil {
 		return err
 	}
 	c.IdentityURL = raw.IdentityURL
@@ -309,7 +309,7 @@ func (c *WispConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	var err error
-	if c.MaxTTL, err = durationValue(raw.MaxTTL, "gost_wisp.max_ttl"); err != nil {
+	if c.MaxTTL, err = durationValue(raw.MaxTTL, "gost-wisp.max_ttl"); err != nil {
 		return err
 	}
 	c.Relay = raw.Relay

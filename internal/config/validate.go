@@ -57,29 +57,29 @@ func (w *WispConfig) validate() error {
 	if w.Relay != "" {
 		u, err := url.Parse(w.Relay)
 		if err != nil || u.Scheme == "" || u.Host == "" {
-			return errors.New("config: gost_wisp.relay: must be a URL such as tunnel+wss://relay.example.com:443")
+			return errors.New("config: gost-wisp.relay: must be a URL such as tunnel+wss://relay.example.com:443")
 		}
 	}
 	if w.Domain != "" {
 		d := strings.TrimSpace(w.Domain)
 		if d == "" {
-			return errors.New("config: gost_wisp.domain: must not be blank")
+			return errors.New("config: gost-wisp.domain: must not be blank")
 		}
 		for _, r := range d {
 			if unicode.IsSpace(r) || r == '/' || r == ':' || r == '\\' {
-				return fmt.Errorf("config: gost_wisp.domain: %q is not a domain name", w.Domain)
+				return fmt.Errorf("config: gost-wisp.domain: %q is not a domain name", w.Domain)
 			}
 		}
 	}
 	if w.MaxTTL != 0 && (w.MaxTTL < time.Second || w.MaxTTL > 24*time.Hour) {
-		return fmt.Errorf("config: gost_wisp.max_ttl: %v is outside the allowed range 1s..24h", w.MaxTTL)
+		return fmt.Errorf("config: gost-wisp.max_ttl: %v is outside the allowed range 1s..24h", w.MaxTTL)
 	}
 	if w.MaxLeases != 0 && (w.MaxLeases < 1 || w.MaxLeases > 64) {
-		return fmt.Errorf("config: gost_wisp.max_leases: %d is outside the allowed range 1..64", w.MaxLeases)
+		return fmt.Errorf("config: gost-wisp.max_leases: %d is outside the allowed range 1..64", w.MaxLeases)
 	}
 	for _, a := range w.Allow {
 		if !validHostOrPrefix(a) {
-			return fmt.Errorf("config: gost_wisp.allow: %q is not an IP address or CIDR prefix", a)
+			return fmt.Errorf("config: gost-wisp.allow: %q is not an IP address or CIDR prefix", a)
 		}
 	}
 	return nil

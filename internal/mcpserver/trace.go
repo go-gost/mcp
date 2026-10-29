@@ -12,7 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// traceInput is the gost_trace tool schema. Egress and target are required;
+// traceInput is the gost-trace tool schema. Egress and target are required;
 // prefix defaults to true so the caller sees cumulative chain prefixes unless
 // it opts out.
 type traceInput struct {
@@ -33,12 +33,12 @@ type traceOutput struct {
 	Egress egressRef `json:"egress"`
 }
 
-// traceTool describes gost_trace. The first sentence states the action and that
+// traceTool describes gost-trace. The first sentence states the action and that
 // the diagnosis goes through an egress profile; the second rules out reading
 // the name as a traceroute.
 func traceTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: "gost_trace",
+		Name: "gost-trace",
 		Description: "Diagnose connectivity through an egress profile stage by stage: local resolve, connect, TLS, and HTTP/read or a DNS query. " +
 			"It traces cumulative chain prefixes (direct, hop 0, hop 0+1, ...), not per-hop TTL hops, and stops at the first failing prefix. " +
 			"It is not a traceroute: a gost chain is a sequence of proxy hops, and per-hop timing inside one hop is not observable. " +
@@ -61,7 +61,7 @@ func (s *server) handleTrace(ctx context.Context, _ *mcp.CallToolRequest, in tra
 
 	target := strings.TrimSpace(in.Target)
 	if target == "" {
-		return nil, traceOutput{}, fmt.Errorf("gost_trace: target is required")
+		return nil, traceOutput{}, fmt.Errorf("gost-trace: target is required")
 	}
 
 	payload, err := decodeTracePayload(in.Payload)
@@ -78,7 +78,7 @@ func (s *server) handleTrace(ctx context.Context, _ *mcp.CallToolRequest, in tra
 	// call; a full server refuses the call instead of queueing more.
 	release, err := s.acquireCall()
 	if err != nil {
-		return nil, traceOutput{}, fmt.Errorf("gost_trace: %w", err)
+		return nil, traceOutput{}, fmt.Errorf("gost-trace: %w", err)
 	}
 	defer release()
 
@@ -94,7 +94,7 @@ func (s *server) handleTrace(ctx context.Context, _ *mcp.CallToolRequest, in tra
 		Expect:      in.Expect,
 	})
 	if err != nil {
-		return nil, traceOutput{}, fmt.Errorf("gost_trace: %w", err)
+		return nil, traceOutput{}, fmt.Errorf("gost-trace: %w", err)
 	}
 
 	// The output schema types identity as an object; report "no identity
@@ -113,7 +113,7 @@ func decodeTracePayload(payload string) ([]byte, error) {
 	}
 	decoded, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {
-		return nil, fmt.Errorf("gost_trace: invalid base64 payload: %w", err)
+		return nil, fmt.Errorf("gost-trace: invalid base64 payload: %w", err)
 	}
 	return decoded, nil
 }

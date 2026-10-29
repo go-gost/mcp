@@ -40,7 +40,7 @@ Notes:
 
 ## Worked prompts
 
-**Reach through an egress (`gost_run`)**
+**Reach through an egress (`gost-run`)**
 
 > Reach https://ifconfig.co through jp and show me the exit IP.
 
@@ -55,7 +55,7 @@ The tool call:
 
 A non-2xx status is still `ok=true`; only a transport failure sets `ok=false` with a classified `failure`.
 
-**Diagnose a target (`gost_trace`)**
+**Diagnose a target (`gost-trace`)**
 
 > Trace example.com:443 through corp and tell me which chain prefix fails.
 
@@ -71,7 +71,7 @@ The tool call:
 
 The result names the first failing cumulative prefix (`direct`, `hop-0`, `hop-0 → hop-1`, ...) and the stage, for example `connect` / `timeout`. A bare `example.com:443` is a TCP trace; use `tls://example.com:443` or an `https://` URL to exercise the TLS stage. `corp` is the multi-hop example profile from the README; use a profile you actually configured.
 
-**Publish a local service (`gost_wisp`)**
+**Publish a local service (`gost-wisp`)**
 
 > Publish 127.0.0.1:3000 at a public URL for 10 minutes.
 
@@ -85,10 +85,10 @@ The tool call:
 }
 ```
 
-The result carries `url`, `handle`, `expires_at`, and `state`. A bare `:3000` is rejected: `local` must include a host and must resolve inside `gost_wisp.allow` (loopback by default).
+The result carries `url`, `handle`, `expires_at`, and `state`. A bare `:3000` is rejected: `local` must include a host and must resolve inside `gost-wisp.allow` (loopback by default).
 
 To revoke early:
 
 > Release the lease you just created.
 
-OpenCode calls `gost_unwisp` with the handle. The URL is public and unauthenticated; the local service must authenticate its own users.
+OpenCode calls `gost-unwisp` with the handle. The URL is public and unauthenticated; the local service must authenticate its own users.

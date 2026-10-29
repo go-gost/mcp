@@ -32,9 +32,9 @@ var DefaultWispAllow = []string{"127.0.0.0/8", "::1/128"}
 // Config is the root of gost-mcp.yml.
 type Config struct {
 	Egress []EgressProfile `yaml:"egress"`
-	Run    RunConfig       `yaml:"gost_run"`
-	Trace  TraceConfig     `yaml:"gost_trace"`
-	Wisp   WispConfig      `yaml:"gost_wisp"`
+	Run    RunConfig       `yaml:"gost-run"`
+	Trace  TraceConfig     `yaml:"gost-trace"`
+	Wisp   WispConfig      `yaml:"gost-wisp"`
 	Log    LogConfig       `yaml:"log"`
 }
 
@@ -48,19 +48,19 @@ type EgressProfile struct {
 	Hops        []*xconfig.HopConfig `yaml:"hops"`
 }
 
-// RunConfig tunes gost_run.
+// RunConfig tunes gost-run.
 type RunConfig struct {
 	Timeout  time.Duration `yaml:"timeout"`
 	MaxBytes int64         `yaml:"max_bytes"`
 }
 
-// TraceConfig tunes gost_trace.
+// TraceConfig tunes gost-trace.
 type TraceConfig struct {
 	Timeout     time.Duration `yaml:"timeout"`
 	IdentityURL string        `yaml:"identity_url"`
 }
 
-// WispConfig tunes gost_wisp / gost_unwisp.
+// WispConfig tunes gost-wisp / gost-unwisp.
 type WispConfig struct {
 	Relay     string        `yaml:"relay"`
 	Domain    string        `yaml:"domain"`

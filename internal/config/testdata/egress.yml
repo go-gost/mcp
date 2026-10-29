@@ -11,15 +11,15 @@ egress:
     chain:
       - "socks5://tokyo.example.com:1080"
 
-gost_run:
+gost-run:
   timeout: 30s
   max_bytes: 1MiB
 
-gost_trace:
+gost-trace:
   timeout: 10s
   identity_url: "https://ifconfig.co/json"
 
-gost_wisp:
+gost-wisp:
   relay: "tunnel+wss://wisper.gost.run:443"
   domain: "gost.run"
   max_ttl: 1h

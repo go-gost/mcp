@@ -13,7 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// runInput is the gost_run tool schema. Egress and URL are required; every
+// runInput is the gost-run tool schema. Egress and URL are required; every
 // other field is optional and documented in its jsonschema tag.
 type runInput struct {
 	Egress          string            `json:"egress" jsonschema:"name of the configured egress profile to send the request through"`
@@ -34,11 +34,11 @@ type runOutput struct {
 	Egress egressRef `json:"egress"`
 }
 
-// runTool describes gost_run. The first sentence states the action and that
+// runTool describes gost-run. The first sentence states the action and that
 // the request goes through an egress profile.
 func runTool() *mcp.Tool {
 	return &mcp.Tool{
-		Name: "gost_run",
+		Name: "gost-run",
 		Description: "Send one HTTP(S) request through an egress profile and return the status, headers, body, timings, and any classified failure. " +
 			"The egress is a configured profile name, never a URL, and the request cannot fall back to a direct connection. " +
 			"A non-2xx status is still a successful call; only a transport failure sets ok=false. " +
@@ -63,7 +63,7 @@ func (s *server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in runIn
 	rawURL := strings.TrimSpace(in.URL)
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, runOutput{}, fmt.Errorf("gost_run: url must be an absolute http or https URL")
+		return nil, runOutput{}, fmt.Errorf("gost-run: url must be an absolute http or https URL")
 	}
 
 	body, err := decodeRunBody(in.Body, in.BodyEncoding)
@@ -78,7 +78,7 @@ func (s *server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in runIn
 
 	release, err := s.acquireCall()
 	if err != nil {
-		return nil, runOutput{}, fmt.Errorf("gost_run: %w", err)
+		return nil, runOutput{}, fmt.Errorf("gost-run: %w", err)
 	}
 	defer release()
 
@@ -92,7 +92,7 @@ func (s *server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in runIn
 		FollowRedirects: followRedirects,
 	})
 	if err != nil {
-		return nil, runOutput{}, fmt.Errorf("gost_run: %w", err)
+		return nil, runOutput{}, fmt.Errorf("gost-run: %w", err)
 	}
 
 	// The output schema types headers as an object, so a failure must still
@@ -116,11 +116,11 @@ func decodeRunBody(body, encoding string) ([]byte, error) {
 		}
 		decoded, err := base64.StdEncoding.DecodeString(body)
 		if err != nil {
-			return nil, fmt.Errorf("gost_run: invalid base64 body: %w", err)
+			return nil, fmt.Errorf("gost-run: invalid base64 body: %w", err)
 		}
 		return decoded, nil
 	default:
-		return nil, fmt.Errorf("gost_run: unsupported body_encoding %q (want %q or %q)",
+		return nil, fmt.Errorf("gost-run: unsupported body_encoding %q (want %q or %q)",
 			encoding, run.EncodingUTF8, run.EncodingBase64)
 	}
 }

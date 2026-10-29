@@ -122,7 +122,7 @@ func TestToolCatalog(t *testing.T) {
 		tools[tool.Name] = tool
 	}
 
-	for _, name := range []string{"gost_run", "gost_trace"} {
+	for _, name := range []string{"gost-run", "gost-trace"} {
 		tool, ok := tools[name]
 		if !ok {
 			t.Fatalf("tool %q not listed; got %v", name, toolNames(res.Tools))
@@ -134,27 +134,27 @@ func TestToolCatalog(t *testing.T) {
 
 	// The wisp tools are not egress tools, but the model must understand that a
 	// published URL is world-readable before it exposes a local service.
-	for _, name := range []string{"gost_wisp", "gost_unwisp"} {
+	for _, name := range []string{"gost-wisp", "gost-unwisp"} {
 		if _, ok := tools[name]; !ok {
 			t.Fatalf("tool %q not listed; got %v", name, toolNames(res.Tools))
 		}
 	}
-	publish := strings.ToLower(tools["gost_wisp"].Description)
+	publish := strings.ToLower(tools["gost-wisp"].Description)
 	for _, want := range []string{"public", "unauthenticated", "authenticate"} {
 		if !strings.Contains(publish, want) {
-			t.Errorf("gost_wisp description does not mention %q: %q", want, tools["gost_wisp"].Description)
+			t.Errorf("gost-wisp description does not mention %q: %q", want, tools["gost-wisp"].Description)
 		}
 	}
-	if !tools["gost_unwisp"].Annotations.IdempotentHint {
-		t.Errorf("gost_unwisp is not marked idempotent: %+v", tools["gost_unwisp"].Annotations)
+	if !tools["gost-unwisp"].Annotations.IdempotentHint {
+		t.Errorf("gost-unwisp is not marked idempotent: %+v", tools["gost-unwisp"].Annotations)
 	}
 
-	trace := tools["gost_trace"]
+	trace := tools["gost-trace"]
 	if !strings.Contains(trace.Description, "cumulative chain prefixes") {
-		t.Errorf("gost_trace description does not mention cumulative chain prefixes: %q", trace.Description)
+		t.Errorf("gost-trace description does not mention cumulative chain prefixes: %q", trace.Description)
 	}
 	if !strings.Contains(trace.Description, "not per-hop TTL hops") {
-		t.Errorf("gost_trace description does not contrast per-hop TTL hops: %q", trace.Description)
+		t.Errorf("gost-trace description does not contrast per-hop TTL hops: %q", trace.Description)
 	}
 }
 
@@ -170,7 +170,7 @@ func TestRunRequiresEgress(t *testing.T) {
 	cs := newTestSession(t, testConfig(), false)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "gost_run",
+		Name:      "gost-run",
 		Arguments: map[string]any{"url": "http://example.com/"},
 	})
 	if err != nil {
@@ -188,7 +188,7 @@ func TestRunUnknownEgressListsNames(t *testing.T) {
 	cs := newTestSession(t, testConfig(), false)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "gost_run",
+		Name:      "gost-run",
 		Arguments: map[string]any{"egress": "nope", "url": "http://example.com/"},
 	})
 	if err != nil {
@@ -218,7 +218,7 @@ func TestRunProxiesRequest(t *testing.T) {
 	cs := newTestSession(t, cfg, false)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "gost_run",
+		Name: "gost-run",
 		Arguments: map[string]any{
 			"egress": "jp",
 			"url":    target.URL,
@@ -251,7 +251,7 @@ func TestRunRejectsInvalidBase64Body(t *testing.T) {
 	cs := newTestSession(t, testConfig(), false)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "gost_run",
+		Name: "gost-run",
 		Arguments: map[string]any{
 			"egress":        "direct",
 			"url":           "http://example.com/",
@@ -279,7 +279,7 @@ func TestTraceReturnsStructuredReport(t *testing.T) {
 	cs := newTestSession(t, testConfig(), false)
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "gost_trace",
+		Name: "gost-trace",
 		Arguments: map[string]any{
 			"egress": "direct",
 			"target": target.URL,
@@ -646,13 +646,13 @@ func (f *fakeProvisioner) lastRequest(t *testing.T) wisp.Request {
 	return f.requests[len(f.requests)-1]
 }
 
-// callWisp invokes gost_wisp and fails the test on a protocol error.
+// callWisp invokes gost-wisp and fails the test on a protocol error.
 func callWisp(t *testing.T, cs *mcp.ClientSession, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost_wisp", Arguments: args})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost-wisp", Arguments: args})
 	if err != nil {
-		t.Fatalf("CallTool gost_wisp: %v", err)
+		t.Fatalf("CallTool gost-wisp: %v", err)
 	}
 	return res
 }
@@ -789,11 +789,11 @@ func TestUnwispIsIdempotent(t *testing.T) {
 	call := func() *mcp.CallToolResult {
 		t.Helper()
 		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      "gost_unwisp",
+			Name:      "gost-unwisp",
 			Arguments: map[string]any{"handle": "handle-1"},
 		})
 		if err != nil {
-			t.Fatalf("CallTool gost_unwisp: %v", err)
+			t.Fatalf("CallTool gost-unwisp: %v", err)
 		}
 		return res
 	}
@@ -834,11 +834,11 @@ func TestUnwispExpiredLeaseIsNotReleased(t *testing.T) {
 	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
 
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "gost_unwisp",
+		Name:      "gost-unwisp",
 		Arguments: map[string]any{"handle": "handle-exp"},
 	})
 	if err != nil {
-		t.Fatalf("CallTool gost_unwisp: %v", err)
+		t.Fatalf("CallTool gost-unwisp: %v", err)
 	}
 	if res.IsError {
 		t.Fatalf("IsError = true, want idempotent success: %s", resultText(res))
@@ -916,11 +916,11 @@ func TestUnwispLogsRelease(t *testing.T) {
 	call := func() *mcp.CallToolResult {
 		t.Helper()
 		r, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      "gost_unwisp",
+			Name:      "gost-unwisp",
 			Arguments: map[string]any{"handle": handle},
 		})
 		if err != nil {
-			t.Fatalf("CallTool gost_unwisp: %v", err)
+			t.Fatalf("CallTool gost-unwisp: %v", err)
 		}
 		return r
 	}
@@ -1019,7 +1019,7 @@ func TestLeasesResource(t *testing.T) {
 func TestWispRequiresLocal(t *testing.T) {
 	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: newFakeProvisioner()})
 
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost_wisp"})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost-wisp"})
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
 	}
