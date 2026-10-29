@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 )
 
 // NewHTTPProxy starts a CONNECT-only HTTP proxy on a loopback port and returns
@@ -18,7 +19,7 @@ import (
 // that traffic actually went through the proxy instead of dialing directly.
 func NewHTTPProxy(t *testing.T, denyTargets ...string) string {
 	t.Helper()
-	return startProxy(t, "", denyTargets)
+	return startProxy(t, "", denyTargets, 0)
 }
 
 // NewHTTPProxyRewriting starts a CONNECT-only HTTP proxy that connects every
@@ -29,12 +30,21 @@ func NewHTTPProxy(t *testing.T, denyTargets ...string) string {
 // server.
 func NewHTTPProxyRewriting(t *testing.T, rewriteTo string) string {
 	t.Helper()
-	return startProxy(t, rewriteTo, nil)
+	return startProxy(t, rewriteTo, nil, 0)
+}
+
+// NewHTTPProxyDelayed starts a CONNECT-only HTTP proxy that waits delay before
+// answering each CONNECT request. It makes the CONNECT round trip visible to a
+// client timing its dial, and with delay longer than the client's timeout it
+// stalls the connect.
+func NewHTTPProxyDelayed(t *testing.T, delay time.Duration, rewriteTo string) string {
+	t.Helper()
+	return startProxy(t, rewriteTo, nil, delay)
 }
 
 // startProxy serves CONNECT on a loopback port. An empty rewriteTo connects to
 // the requested target.
-func startProxy(t *testing.T, rewriteTo string, denyTargets []string) string {
+func startProxy(t *testing.T, rewriteTo string, denyTargets []string, delay time.Duration) string {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -59,7 +69,7 @@ func startProxy(t *testing.T, rewriteTo string, denyTargets []string) string {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				serveCONNECT(conn, rewriteTo, deny)
+				serveCONNECT(conn, rewriteTo, deny, delay)
 			}()
 		}
 	}()
@@ -72,9 +82,9 @@ func startProxy(t *testing.T, rewriteTo string, denyTargets []string) string {
 	return ln.Addr().String()
 }
 
-// serveCONNECT handles one client: it reads the CONNECT request, dials the
-// target, reports success, and then relays bytes in both directions.
-func serveCONNECT(conn net.Conn, rewriteTo string, deny map[string]bool) {
+// serveCONNECT handles one client: it reads the CONNECT request, waits delay,
+// dials the target, reports success, and then relays bytes in both directions.
+func serveCONNECT(conn net.Conn, rewriteTo string, deny map[string]bool, delay time.Duration) {
 	defer conn.Close()
 
 	br := bufio.NewReader(conn)
@@ -89,6 +99,13 @@ func serveCONNECT(conn net.Conn, rewriteTo string, deny map[string]bool) {
 	if deny[req.Host] {
 		writeStatus(conn, http.StatusBadGateway)
 		return
+	}
+
+	// The delay is before the 200 response on purpose: it stalls the CONNECT
+	// round trip exactly where a client timing its dial cannot see through
+	// httptrace.
+	if delay > 0 {
+		time.Sleep(delay)
 	}
 
 	target := req.Host

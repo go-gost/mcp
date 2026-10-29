@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-gost/mcp/internal/config"
 	"github.com/go-gost/mcp/internal/egress"
@@ -77,8 +78,10 @@ type Output struct {
 	Failure      *failure.Failure  `json:"failure"`
 }
 
-// Timings are wall-clock milliseconds. Connect and TLS accumulate across
-// redirects; TTFB is measured to the first byte of the last response.
+// Timings are wall-clock milliseconds. Connect is the whole dial, including
+// whatever name resolution the egress performs and, through a chain, the proxy
+// CONNECT round trip. Connect and TLS accumulate across dials and redirects;
+// TTFB is measured to the first byte of the last response.
 type Timings struct {
 	ConnectMS int64 `json:"connect_ms"`
 	TLSMS     int64 `json:"tls_ms"`
@@ -147,11 +150,6 @@ func Do(ctx context.Context, e *egress.Egress, in Input) (Output, error) {
 
 	rec := &recorder{start: time.Now()}
 	trace := &httptrace.ClientTrace{
-		ConnectStart: func(_, _ string) { rec.connectStart() },
-		ConnectDone: func(_, _ string, err error) {
-			rec.connectDone()
-			rec.failedOperation(failure.StageConnect, err)
-		},
 		TLSHandshakeStart: rec.tlsStart,
 		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
 			rec.tlsDone()
@@ -165,11 +163,20 @@ func Do(ctx context.Context, e *egress.Egress, in Input) (Output, error) {
 		// The egress is the only egress: never consult HTTP_PROXY.
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Time the whole dial rather than the TCP connect: the target
+			// name is resolved by the exit, and through a chain the proxy
+			// CONNECT round trip happens here too. httptrace's
+			// ConnectStart/ConnectDone see only the TCP connect to the proxy
+			// (after local resolution), so they would hide that time.
+			start := time.Now()
 			route, err := e.Route(ctx, network, addr)
 			if err != nil {
+				rec.dialDone(time.Since(start))
 				return nil, err
 			}
-			return route.Dial(ctx, network, addr)
+			conn, err := route.Dial(ctx, network, addr)
+			rec.dialDone(time.Since(start))
+			return conn, err
 		},
 		// One request per connection: a tool call must not inherit a stale
 		// socket, and there is nothing to reuse afterwards.
@@ -238,7 +245,9 @@ func Do(ctx context.Context, e *egress.Egress, in Input) (Output, error) {
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, readLimit(maxBytes)))
 	if err != nil {
 		f := rec.classify(err)
-		if f != nil && f.Stage != failure.StageCanceled {
+		// A timeout stays {timeout, timeout}; only a non-timeout read error is
+		// re-staged as a read failure.
+		if f != nil && f.Stage != failure.StageCanceled && f.Code != failure.CodeTimeout {
 			f.Stage = failure.StageRead
 		}
 		out.OK = false
@@ -251,10 +260,12 @@ func Do(ctx context.Context, e *egress.Egress, in Input) (Output, error) {
 		out.Truncated = true
 		raw = raw[:maxBytes]
 	}
-	if isText(resp.Header.Get("Content-Type")) {
+	if isText(resp.Header.Get("Content-Type")) && utf8.Valid(raw) {
 		out.Body = string(raw)
 		out.BodyEncoding = EncodingUTF8
 	} else {
+		// A declared text type is not enough: bytes that are not UTF-8 would
+		// reach the model as mojibake. Report the exact bytes instead.
 		out.Body = base64.StdEncoding.EncodeToString(raw)
 		out.BodyEncoding = EncodingBase64
 	}
@@ -347,7 +358,6 @@ type recorder struct {
 	mu sync.Mutex
 
 	start     time.Time
-	connectAt time.Time
 	tlsAt     time.Time
 	connectMS int64
 	tlsMS     int64
@@ -357,19 +367,12 @@ type recorder struct {
 	op failure.Stage
 }
 
-func (r *recorder) connectStart() {
+// dialDone accumulates one completed dial. The transport may dial more than
+// once (redirects, happy eyeballs), so every dial counts.
+func (r *recorder) dialDone(d time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.connectAt = time.Now()
-}
-
-func (r *recorder) connectDone() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.connectAt.IsZero() {
-		r.connectMS += time.Since(r.connectAt).Milliseconds()
-		r.connectAt = time.Time{}
-	}
+	r.connectMS += d.Milliseconds()
 }
 
 func (r *recorder) tlsStart() {
@@ -425,6 +428,11 @@ func (r *recorder) classify(err error) *failure.Failure {
 	// Cancellation is reported as such: the operation did not get a chance to
 	// fail on its own.
 	if f.Stage == failure.StageCanceled {
+		return f
+	}
+	// A timeout is always {timeout, timeout}, whatever stage was running
+	// when the clock ran out: the caller can only retry, not re-stage it.
+	if f.Code == failure.CodeTimeout {
 		return f
 	}
 

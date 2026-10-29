@@ -107,8 +107,7 @@ func classify(err error) *Failure {
 		return &Failure{Stage: StageTLS, Code: CodeTLSVerify}
 	}
 
-	var recordErr *tls.RecordHeaderError
-	if errors.As(err, &recordErr) || isTLSMessage(err) {
+	if isTLSMessage(err) {
 		return &Failure{Stage: StageTLS, Code: CodeTLSHandshake}
 	}
 

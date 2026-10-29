@@ -2,8 +2,10 @@ package run
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -204,6 +206,35 @@ func TestRunBinaryBodyIsBase64(t *testing.T) {
 	}
 	if out.Body != "AAEC//4=" {
 		t.Errorf("Body = %q, want %q", out.Body, "AAEC//4=")
+	}
+	if out.Bytes != int64(len(payload)) {
+		t.Errorf("Bytes = %d, want %d", out.Bytes, len(payload))
+	}
+}
+
+// TestRunInvalidUTF8FallsBackToBase64 pins that a text content type does not
+// license mojibake: bytes that are not UTF-8 are returned base64-encoded, so
+// the caller gets the exact bytes back.
+func TestRunInvalidUTF8FallsBackToBase64(t *testing.T) {
+	payload := []byte{'a', 0xe9, 'b'}
+	srv, _ := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=iso-8859-1")
+		w.Write(payload)
+	}))
+
+	out, err := Do(context.Background(), directEgress(t), Input{URL: srv.URL, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if out.BodyEncoding != EncodingBase64 {
+		t.Fatalf("BodyEncoding = %q, want base64 for non-UTF-8 text", out.BodyEncoding)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(out.Body)
+	if err != nil {
+		t.Fatalf("Body is not valid base64: %v", err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Errorf("decoded body = %x, want %x", decoded, payload)
 	}
 	if out.Bytes != int64(len(payload)) {
 		t.Errorf("Bytes = %d, want %d", out.Bytes, len(payload))
@@ -519,6 +550,91 @@ func TestRunSucceedsWhenLocalResolveFails(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("the target server did not see the request")
+	}
+}
+
+// TestRunConnectTimingIncludesProxyDial pins that connect_ms covers the CONNECT
+// round trip, not just the TCP connect to the proxy: httptrace's ConnectDone
+// fires before the proxy has answered, so only timing the dial closure sees
+// the exit's resolution and connect work.
+func TestRunConnectTimingIncludesProxyDial(t *testing.T) {
+	const proxyDelay = 100 * time.Millisecond
+
+	_, target := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "delayed-proxy")
+	}))
+	proxyAddr := testutil.NewHTTPProxyDelayed(t, proxyDelay, target)
+
+	out, err := Do(context.Background(), proxyEgress(t, proxyAddr), Input{
+		URL:      "http://timing.example/",
+		Timeout:  5 * time.Second,
+		MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if !out.OK {
+		t.Fatalf("OK = false, failure = %+v", out.Failure)
+	}
+	// 80ms is a generous lower bound: the proxy sleeps 100ms before answering.
+	if out.Timings.ConnectMS < 80 {
+		t.Errorf("Timings.ConnectMS = %d, want at least 80 for a 100ms CONNECT delay", out.Timings.ConnectMS)
+	}
+}
+
+// TestRunConnectTimeoutIsStageTimeout pins the contract that a timeout is
+// always {timeout, timeout}: the proxy stalls the CONNECT past the request
+// deadline, so the failure must not be reported as {connect, timeout}.
+func TestRunConnectTimeoutIsStageTimeout(t *testing.T) {
+	_, target := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "too late")
+	}))
+	proxyAddr := testutil.NewHTTPProxyDelayed(t, 400*time.Millisecond, target)
+
+	out, err := Do(context.Background(), proxyEgress(t, proxyAddr), Input{
+		URL:     "http://stalled.example/",
+		Timeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Do returned a Go error, want a classified failure: %v", err)
+	}
+	if out.OK {
+		t.Fatal("OK = true, want false")
+	}
+	if out.Failure == nil {
+		t.Fatal("Failure = nil, want a timeout failure")
+	}
+	if out.Failure.Stage != failure.StageTimeout {
+		t.Errorf("Stage = %q, want %q", out.Failure.Stage, failure.StageTimeout)
+	}
+	if out.Failure.Code != failure.CodeTimeout {
+		t.Errorf("Code = %q, want %q", out.Failure.Code, failure.CodeTimeout)
+	}
+	if !out.Failure.Retryable {
+		t.Error("Retryable = false, want true for a timeout")
+	}
+}
+
+// TestRecorderTimeoutKeepsTimeoutStage pins the stage override rule for the
+// paths a network test cannot make deterministic: a timeout is always
+// {timeout, timeout}, even when the clock ran out during the TLS handshake
+// (the recorder's failed operation is tls).
+func TestRecorderTimeoutKeepsTimeoutStage(t *testing.T) {
+	rec := &recorder{}
+	rec.failedOperation(failure.StageTLS, io.EOF)
+
+	f := rec.classify(context.DeadlineExceeded)
+	if f == nil {
+		t.Fatal("classify returned nil, want a timeout failure")
+	}
+	if f.Stage != failure.StageTimeout {
+		t.Errorf("Stage = %q, want %q", f.Stage, failure.StageTimeout)
+	}
+	if f.Code != failure.CodeTimeout {
+		t.Errorf("Code = %q, want %q", f.Code, failure.CodeTimeout)
+	}
+	if !f.Retryable {
+		t.Error("Retryable = false, want true for a timeout")
 	}
 }
 
