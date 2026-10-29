@@ -6,14 +6,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/go-gost/mcp/internal/config"
+	"github.com/go-gost/mcp/internal/egress"
+	"github.com/go-gost/mcp/internal/mcpserver"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // version is set at build time with -ldflags "-X main.version=v0.1.0".
@@ -37,7 +44,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	_ = *exposeTopology // consumed by the MCP server in a later step
 
 	if *showVersion {
 		fmt.Fprintf(stdout, "gost-mcp %s\n", version)
@@ -60,8 +66,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if !*check {
-		fmt.Fprintln(stderr, "gost-mcp: the MCP server is not implemented yet; use --check to validate the configuration")
-		return 1
+		reg, err := egress.BuildAll(cfg.Egress)
+		if err != nil {
+			fmt.Fprintf(stderr, "gost-mcp: %v\n", err)
+			return 1
+		}
+
+		fmt.Fprintf(stderr, "gost-mcp %s: %d egress profile(s) resolved; waiting for MCP messages on stdio\n",
+			version, len(reg.Profiles()))
+
+		srv := mcpserver.New(cfg, mcpserver.Deps{
+			Egress:         reg,
+			ExposeTopology: *exposeTopology,
+			Version:        version,
+		})
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
+			fmt.Fprintf(stderr, "gost-mcp: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stderr, "gost-mcp: server stopped")
+		return 0
 	}
 
 	if err := printProfiles(stdout, cfg); err != nil {
