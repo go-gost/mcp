@@ -4,7 +4,7 @@ project_name: gost-mcp
 
 before:
   hooks:
-    - go mod tidy
+    - go mod download
 
 builds:
   - id: gost-mcp

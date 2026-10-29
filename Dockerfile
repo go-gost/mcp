@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
-# Build stage. go.mod requires Go 1.26.3, so 1.27 is the first stable image
-# that can build the module.
+# Build stage. Current stable Go image; go.mod requires Go 1.26.3 or newer, so
+# any image at or above that toolchain works.
 FROM golang:1.27 AS build
 
 WORKDIR /src

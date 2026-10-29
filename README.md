@@ -10,10 +10,10 @@ It is a single binary that speaks MCP over stdio. It needs no running gost insta
 
 ## What it is
 
-- **Explicit egress.** Every call names an egress profile from a local file. An omitted or unknown profile is an error; there is no silent fallback to a direct connection.
+- **Explicit egress.** Every `gost_run` and `gost_trace` call names an egress profile from a local file. An omitted or unknown profile is an error; there is no silent fallback to a direct connection. (`gost_wisp` and `gost_unwisp` use the configured relay, not an egress profile.)
 - **One-shot.** Each call is self-contained and returns a complete result or a classified failure such as `stage=connect, code=timeout`. Nothing is inferred from previous calls. The only state that outlives a call is a wisp lease, addressed by an explicit handle.
 - **Local.** Egress profiles are read once at startup from `gost-mcp.yml`. There is no remote profile distribution and no hot reload.
-- **Small surface.** Four tools and two resources. The model sees profile names and descriptions, never node addresses unless you opt in with `--expose-topology`.
+- **Small surface.** Four tools and two resources. `gost-mcp://egress` exposes profile names and descriptions only; node addresses appear there only when you opt in with `--expose-topology`. That filter is about the resource, not about every string: a failure message can quote the address of the node that failed (for example `dial tcp 10.0.0.2:8080: i/o timeout`), because `failure.message` comes straight from the dial path.
 
 ## What it is not
 
@@ -150,9 +150,10 @@ Notes:
 - The `resolve` stage is local and informational. With SOCKS5/HTTP CONNECT the exit resolves the name, so a local DNS failure does not prove the chain fails.
 - `mode=dns` sends an explicit query **through the egress** to `resolver` (default: the first nameserver in `/etc/resolv.conf`).
 - Prefix probing connects only and stops at the first failure. The full chain then runs the complete stage test. With a multi-node hop, the probe and the final attempt may use different nodes, so attribution is best-effort and each prefix reports `served_by` (node names, never addresses).
+- The **first prefix is always a direct baseline**: `gost_trace` dials the target from *this host*, without the selected egress, and reports it as `path: ["direct"]`. That baseline is real traffic leaving from here even when a proxy profile is selected, so it also reveals which hop is at fault. Pass `prefix: false` when even that single direct connection is not acceptable.
 - `timeout_ms` is a budget for the whole call. A timeout returns the prefixes that completed plus `ok=false`.
 - An empty route is `code=no_route`, never a direct dial.
-- `identity` makes one extra HTTPS request through the full chain to `gost_trace.identity_url` and reports `{ip, family, country, asn, org}` when the endpoint provides them.
+- `identity` makes one extra request through the full chain to `gost_trace.identity_url` (HTTPS by default) and reports `{ip, family, country, asn, org}` when the endpoint provides them.
 
 ### `gost_wisp`
 
@@ -369,9 +370,9 @@ Read this before pointing the server at anything real.
 - **Publishing is loopback-only by default.** `gost_wisp.allow` defaults to `127.0.0.0/8` and `::1/128`. Widening it is a configuration decision; there is no tool argument for it. The relay address is also configuration-only, so a model cannot point a tunnel at an arbitrary relay.
 - **There is no `env:` header indirection.** `gost_run.headers` values are literal. A secret placed in a header is visible to the model and in the request. This is deliberate: header-to-server-secret indirection would let a prompt-injected model exfiltrate a credential to an arbitrary host.
 - **Credentials belong in the MCP client's environment, not the YAML.** Reference them as `${JP_PASS}`. If the file does contain credentials, `chmod 0600` it; `--check` and startup warn when it is group- or world-readable.
-- **No hidden direct egress.** `egress` is required, an unknown name is an error, and profiles cannot use `bypass`/`matcher`/`filter` to skip a hop.
+- **No hidden direct egress in the requested path.** `egress` is required, an unknown name is an error, and profiles cannot use `bypass`/`matcher`/`filter` to skip a hop: the requested egress never falls back to a direct dial. One connection is direct on purpose — the [`gost_trace` prefix baseline](#gost_trace), which always dials from this host. Pass `prefix: false` if that baseline is not acceptable.
 - **No network listener in v0.** MCP uses stdio, so there is no port to authenticate. stdout carries protocol frames; all logs and warnings go to stderr.
-- **Leases are logged and bounded.** Publications and releases are logged to stderr with label, target, URL, handle, and expiry — never credentials or node addresses. TTL, lease count, and target allow-list are enforced.
+- **Leases are logged and bounded.** A publication logs label, target, URL, handle, and expiry to stderr; a release logs the handle, URL, and `released` flag. Neither includes credentials or node addresses. TTL, lease count, and target allow-list are enforced.
 
 ## Build and test
 
