@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -32,6 +33,9 @@ const (
 	StateActive  = "active"
 	StateRebound = "rebound"
 	StateExpired = "expired"
+	// StateDead means the relay service stopped unexpectedly. The tunnel is
+	// closed and its lease slot is free, but the record remains for reporting.
+	StateDead = "dead"
 )
 
 const (
@@ -63,8 +67,22 @@ var ErrTargetNotAllowed = errors.New("wisp: target not allowed")
 // or whitespace would be interpreted by gost's parser.
 var ErrInvalidTarget = errors.New("wisp: invalid target")
 
-// httpClient performs the optional reachability check. Tests replace it.
-var httpClient = &http.Client{Timeout: verifyTimeout}
+// httpClient performs the optional reachability check. Tests replace it. It
+// never uses an environment proxy and never follows a redirect: the check is
+// one request to the public URL, exactly as a client sees it.
+var httpClient = newVerifyClient()
+
+func newVerifyClient() *http.Client {
+	return &http.Client{
+		Timeout: verifyTimeout,
+		// The public URL is the target; an environment proxy would make the
+		// reachability test answer a different question.
+		Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
 
 // Request describes one publication.
 type Request struct {
@@ -99,6 +117,9 @@ type Provisioner interface {
 	Provision(ctx context.Context, req Request) (Lease, error)
 	Release(ctx context.Context, handle string) (Lease, bool)
 	List() []Lease
+	// Close releases every live lease. It is idempotent; main calls it on
+	// SIGINT/SIGTERM so a process shutdown never leaves relay services behind.
+	Close()
 }
 
 // ServiceFactory constructs the service that publishes addr. name is the
@@ -250,6 +271,7 @@ func (p *provisioner) Provision(ctx context.Context, req Request) (Lease, error)
 	reserved = false
 
 	go p.watch(l)
+	go p.monitor(l, serveErr)
 
 	return out, nil
 }
@@ -284,6 +306,34 @@ func (p *provisioner) Release(ctx context.Context, handle string) (Lease, bool) 
 		releaseReal(svc)
 	}
 	return out, true
+}
+
+// Close releases every live lease and forgets its record. It is idempotent:
+// a second call finds nothing to close.
+func (p *provisioner) Close() {
+	p.mu.Lock()
+	leases := make([]*lease, 0, len(p.leases))
+	for _, l := range p.leases {
+		leases = append(leases, l)
+	}
+	p.leases = make(map[string]*lease)
+	p.expired = nil
+	p.mu.Unlock()
+
+	for _, l := range leases {
+		p.mu.Lock()
+		l.stopLocked()
+		alreadyClosed := l.closed
+		l.closed = true
+		svc := l.svc
+		l.svc = nil
+		p.mu.Unlock()
+
+		if !alreadyClosed && svc != nil {
+			svc.Close()
+			releaseReal(svc)
+		}
+	}
 }
 
 // List returns a snapshot of every lease, including expired ones, ordered by
@@ -341,11 +391,33 @@ func (p *provisioner) checkTarget(ctx context.Context, local string) (string, er
 		}
 	}
 
-	picked, ok := netip.AddrFromSlice(addrs[0].IP)
+	picked, ok := preferredAddr(addrs)
 	if !ok {
 		return "", fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
 	}
 	return net.JoinHostPort(picked.Unmap().String(), port), nil
+}
+
+// preferredAddr picks the address to pin. IPv4 is preferred when a name
+// resolves to both families: a dual-stack host often has a working IPv4 path
+// while an advertised IPv6 address is unreachable from the relay. IPv6 is used
+// when it is the only family available.
+func preferredAddr(addrs []net.IPAddr) (netip.Addr, bool) {
+	var firstV6 netip.Addr
+	for _, a := range addrs {
+		addr, ok := netip.AddrFromSlice(a.IP)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		if addr.Is4() {
+			return addr, true
+		}
+		if !firstV6.IsValid() {
+			firstV6 = addr
+		}
+	}
+	return firstV6, firstV6.IsValid()
 }
 
 // validHost accepts an IP literal (v4 or v6) or a DNS name made only of
@@ -404,15 +476,16 @@ func (p *provisioner) allowed(ip net.IP) bool {
 	return false
 }
 
-// reserve claims one of the MaxLeases slots. Expired leases no longer occupy a
-// slot: their tunnel is closed and only the record remains for reporting.
+// reserve claims one of the MaxLeases slots. Expired and dead leases no longer
+// occupy a slot: their tunnel is closed and only the record remains for
+// reporting.
 func (p *provisioner) reserve() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	used := p.reserved
 	for _, l := range p.leases {
-		if l.State != StateExpired {
+		if leaseLive(l.State) {
 			used++
 		}
 	}
@@ -421,6 +494,11 @@ func (p *provisioner) reserve() error {
 	}
 	p.reserved++
 	return nil
+}
+
+// leaseLive reports whether a lease still owns a tunnel slot.
+func leaseLive(state string) bool {
+	return state == StateActive || state == StateRebound
 }
 
 func (p *provisioner) unreserve() {
@@ -479,10 +557,52 @@ func (p *provisioner) watch(l *lease) {
 				l.host = host
 				l.URL = p.url(host)
 				l.State = StateRebound
+				slog.Info("wisp: lease rebound",
+					"handle", l.Handle,
+					"url", l.URL,
+				)
 			}
 			p.mu.Unlock()
 		}
 	}
+}
+
+// monitor follows the running service. When Serve returns an error the tunnel
+// is gone: mark the lease dead, close it, unregister its chain, free the slot,
+// and record the event. A nil error is an orderly shutdown (Release/expire/
+// Close) and changes nothing.
+func (p *provisioner) monitor(l *lease, serveErr <-chan error) {
+	err, ok := <-serveErr
+	if !ok || err == nil {
+		return
+	}
+	p.died(l, err)
+}
+
+func (p *provisioner) died(l *lease, err error) {
+	p.mu.Lock()
+	cur, ok := p.leases[l.Handle]
+	if !ok || cur != l || l.stopped || l.State == StateExpired || l.State == StateDead {
+		p.mu.Unlock()
+		return
+	}
+	l.State = StateDead
+	l.stopLocked()
+	l.closed = true
+	svc := l.svc
+	l.svc = nil
+	handle, url := l.Handle, l.URL
+	p.mu.Unlock()
+
+	if svc != nil {
+		svc.Close()
+		releaseReal(svc)
+	}
+	slog.Warn("wisp: lease dead",
+		"handle", handle,
+		"url", url,
+		"error", err,
+	)
 }
 
 // expire closes an expired lease's tunnel, marks it expired, and drops its

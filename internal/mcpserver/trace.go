@@ -75,10 +75,10 @@ func (s *server) handleTrace(ctx context.Context, _ *mcp.CallToolRequest, in tra
 	}
 
 	// Bound abandoned dial goroutines and file descriptors before starting a
-	// trace; a full server refuses the call instead of queueing more.
-	release, err := s.acquireTrace()
+	// call; a full server refuses the call instead of queueing more.
+	release, err := s.acquireCall()
 	if err != nil {
-		return nil, traceOutput{}, err
+		return nil, traceOutput{}, fmt.Errorf("gost_trace: %w", err)
 	}
 	defer release()
 

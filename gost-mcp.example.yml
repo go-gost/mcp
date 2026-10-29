@@ -12,33 +12,35 @@
 # value; an unset variable is a startup error, never an empty string. If the
 # file does contain credentials, chmod 0600 it.
 #
-# Note: environment expansion runs before YAML parsing, so an undefined
-# variable reference fails even when it appears in a comment. Do not write
-# variable references in comments.
+# Note: environment expansion runs after YAML parsing, on scalar string values
+# only. A variable reference in a comment or a key is not expanded, and an
+# unset variable in a value is still a startup error.
 
 egress:
   - name: direct
     description: "Host direct, no proxy"
     chain: []
 
-  # A chain is a list of gost -F URIs. Each entry is one hop.
+  # A chain is a list of gost -F URIs. Each entry is one hop. `scheme://` is
+  # only valid in this sugar form.
   # - name: jp
   #   description: "Tokyo residential exit (SOCKS5)"
   #   chain:
   #     - "socks5://USER:PASSWORD@tokyo.example.com:1080"
 
-  # Use hops when one hop needs a pool of nodes.
+  # Use hops when one hop needs a pool of nodes. An explicit node's addr is
+  # host:port; the protocol lives in connector.type.
   # - name: corp
   #   description: "Corp exit: HTTP proxy, then internal SOCKS5"
   #   hops:
   #     - name: hop-0
   #       selector: { strategy: round }
   #       nodes:
-  #         - { name: a, addr: "http://10.0.0.1:8080" }
-  #         - { name: b, addr: "http://10.0.0.2:8080" }
+  #         - { name: a, addr: "10.0.0.1:8080", connector: { type: http } }
+  #         - { name: b, addr: "10.0.0.2:8080", connector: { type: http } }
   #     - name: hop-1
   #       nodes:
-  #         - { name: c, addr: "socks5://10.0.1.5:1080" }
+  #         - { name: c, addr: "10.0.1.5:1080", connector: { type: socks5 } }
 
 gost_run:
   timeout: 30s

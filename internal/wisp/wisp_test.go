@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -30,20 +31,30 @@ func (a testAddr) String() string  { return a.host + ":0" }
 // fakeService is a service.Service whose address can change while running and
 // whose Close is observable.
 type fakeService struct {
-	mu      sync.Mutex
-	addr    net.Addr
-	closes  atomic.Int32
-	done    chan struct{}
-	stopped sync.Once
+	mu       sync.Mutex
+	addr     net.Addr
+	closes   atomic.Int32
+	done     chan struct{}
+	serveErr chan error
+	stopped  sync.Once
 }
 
 func newFakeService(addr net.Addr) *fakeService {
-	return &fakeService{addr: addr, done: make(chan struct{})}
+	return &fakeService{addr: addr, done: make(chan struct{}), serveErr: make(chan error, 1)}
 }
 
 func (s *fakeService) Serve() error {
-	<-s.done
-	return nil
+	select {
+	case <-s.done:
+		return nil
+	case err := <-s.serveErr:
+		return err
+	}
+}
+
+// fail makes Serve return err, standing in for a relay/service crash.
+func (s *fakeService) fail(err error) {
+	s.serveErr <- err
 }
 
 func (s *fakeService) Addr() net.Addr {
@@ -473,7 +484,119 @@ func TestLeaseURLUpdatesOnRebind(t *testing.T) {
 	}
 }
 
-// roundTripFunc adapts a function to http.RoundTripper.
+// TestServiceDeathMarksLeaseDeadAndFreesSlot pins the per-lease lifecycle: a
+// relay service that stops unexpectedly marks the lease dead, closes it, and
+// releases the slot for a new publication.
+func TestServiceDeathMarksLeaseDeadAndFreesSlot(t *testing.T) {
+	var svcs []*fakeService
+	var mu sync.Mutex
+	factory := func(context.Context, string, string) (service.Service, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		svc := newFakeService(testAddr{host: fmt.Sprintf("h%d", len(svcs)+1)})
+		svcs = append(svcs, svc)
+		return svc, nil
+	}
+	cfg := testConfig()
+	cfg.MaxLeases = 1
+
+	p := New(cfg, factory)
+	first, err := p.Provision(context.Background(), Request{Local: "127.0.0.1:8080"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	svcs[0].fail(errors.New("relay closed"))
+
+	ok := waitFor(t, 2*time.Second, func() bool {
+		leases := p.List()
+		return len(leases) == 1 && leases[0].State == StateDead && svcs[0].closes.Load() == 1
+	})
+	if !ok {
+		t.Fatalf("lease did not become dead, List = %+v, closes = %d", p.List(), svcs[0].closes.Load())
+	}
+
+	second, err := p.Provision(context.Background(), Request{Local: "127.0.0.1:8080"})
+	if err != nil {
+		t.Fatalf("Provision after a dead lease: %v (the slot must be free)", err)
+	}
+	if second.Handle == first.Handle {
+		t.Error("second lease reused the dead handle")
+	}
+	p.Close()
+}
+
+// TestCloseReleasesAllLeases pins shutdown cleanup: main calls Close on
+// SIGINT/SIGTERM, so every live tunnel must be closed exactly once.
+func TestCloseReleasesAllLeases(t *testing.T) {
+	var svcs []*fakeService
+	factory := func(context.Context, string, string) (service.Service, error) {
+		svc := newFakeService(testAddr{host: fmt.Sprintf("h%d", len(svcs)+1)})
+		svcs = append(svcs, svc)
+		return svc, nil
+	}
+	p := New(testConfig(), factory)
+
+	for i := 0; i < 2; i++ {
+		if _, err := p.Provision(context.Background(), Request{Local: "127.0.0.1:8080"}); err != nil {
+			t.Fatalf("Provision %d: %v", i, err)
+		}
+	}
+
+	p.Close()
+	for i, svc := range svcs {
+		if got := svc.closes.Load(); got != 1 {
+			t.Errorf("service %d Close called %d times, want 1", i, got)
+		}
+	}
+	if leases := p.List(); len(leases) != 0 {
+		t.Errorf("List after Close = %+v, want empty", leases)
+	}
+
+	p.Close() // idempotent
+	for i, svc := range svcs {
+		if got := svc.closes.Load(); got != 1 {
+			t.Errorf("service %d Close called %d times after a second Close, want 1", i, got)
+		}
+	}
+}
+
+// TestPreferredAddrPrefersIPv4 pins the pinning rule: a dual-stack name pins
+// IPv4, while an IPv6-only name keeps IPv6.
+func TestPreferredAddrPrefersIPv4(t *testing.T) {
+	both := []net.IPAddr{
+		{IP: net.ParseIP("2001:db8::1")},
+		{IP: net.ParseIP("127.0.0.1")},
+	}
+	got, ok := preferredAddr(both)
+	if !ok || !got.Is4() || got.String() != "127.0.0.1" {
+		t.Errorf("preferredAddr(dual stack) = %v, %v; want 127.0.0.1", got, ok)
+	}
+
+	v6 := []net.IPAddr{{IP: net.ParseIP("2001:db8::1")}}
+	got, ok = preferredAddr(v6)
+	if !ok || got.Is4() || got.String() != "2001:db8::1" {
+		t.Errorf("preferredAddr(IPv6 only) = %v, %v; want 2001:db8::1", got, ok)
+	}
+}
+
+// TestVerifyDoesNotFollowRedirect pins that verify reports the status of the
+// public URL itself rather than chasing its redirect.
+func TestVerifyDoesNotFollowRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	old := httpClient
+	httpClient = newVerifyClient()
+	t.Cleanup(func() { httpClient = old })
+
+	res := verifyURL(context.Background(), srv.URL)
+	if !res.Checked || res.Status != http.StatusFound {
+		t.Errorf("verifyURL = %+v, want the 302 without following it", res)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

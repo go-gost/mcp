@@ -8,6 +8,7 @@ import (
 	"time"
 
 	xconfig "github.com/go-gost/x/config"
+	"gopkg.in/yaml.v3"
 )
 
 // validProfile returns a profile that passes Validate, so a test can mutate
@@ -62,6 +63,72 @@ func TestLoadUnknownSectionIsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "services") {
 		t.Fatalf("error = %v, want it to name the unknown field", err)
+	}
+}
+
+// TestLoadExpandsOnlyScalarValues pins that ${...} in a comment is not
+// expanded, and that a substituted value with YAML metacharacters lands intact
+// after parsing.
+func TestLoadExpandsOnlyScalarValues(t *testing.T) {
+	t.Setenv("WEIRD_PASS", `p"a#s:s`)
+	t.Setenv("JP_USER", "alice")
+
+	path := filepath.Join(t.TempDir(), "gost-mcp.yml")
+	data := `
+# This comment mentions ${NOT_A_REAL_VARIABLE} and must not be expanded.
+# A key named ${KEY} is not a value either.
+egress:
+  - name: jp
+    description: "exit for ${JP_USER} using ${WEIRD_PASS}"
+    chain:
+      - "socks5://${JP_USER}@host:1080"
+`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.Egress) != 1 {
+		t.Fatalf("len(Egress) = %d, want 1", len(c.Egress))
+	}
+	// The substituted value contains a quote, a hash, and a colon. Expanding
+	// the raw bytes would have closed the YAML string early and turned the
+	// rest into a comment.
+	if got, want := c.Egress[0].Description, `exit for alice using p"a#s:s`; got != want {
+		t.Errorf("Description = %q, want %q", got, want)
+	}
+	if got, want := c.Egress[0].Chain[0], "socks5://alice@host:1080"; got != want {
+		t.Errorf("Chain[0] = %q, want %q", got, want)
+	}
+}
+
+// TestExpandEnvKeepsPasswordIntact pins the value-level substitution directly:
+// a password containing a quote, hash, and colon survives the round trip into a
+// valid YAML document.
+func TestExpandEnvKeepsPasswordIntact(t *testing.T) {
+	t.Setenv("PASS", `p"a#s:s`)
+	out, err := expandEnv([]byte(`
+egress:
+  - chain:
+      - "socks5://u:${PASS}@host:1080"
+`))
+	if err != nil {
+		t.Fatalf("expandEnv: %v", err)
+	}
+
+	var doc struct {
+		Egress []struct {
+			Chain []string `yaml:"chain"`
+		} `yaml:"egress"`
+	}
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("expanded YAML does not parse: %v\n%s", err, out)
+	}
+	if got, want := doc.Egress[0].Chain[0], `socks5://u:p"a#s:s@host:1080`; got != want {
+		t.Errorf("chain = %q, want %q", got, want)
 	}
 }
 
@@ -367,6 +434,20 @@ func TestValidateRejectsNamedResolution(t *testing.T) {
 				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
 			}
 		})
+	}
+}
+
+// TestValidateRejectsNodeProbe rejects gost's active node probing: an egress
+// profile must not generate traffic unrelated to a tool call.
+func TestValidateRejectsNodeProbe(t *testing.T) {
+	hop := &xconfig.HopConfig{Name: "hop-0", Nodes: []*xconfig.NodeConfig{{
+		Name:  "n0",
+		Addr:  "10.0.0.1:8080",
+		Probe: &xconfig.ProbeConfig{},
+	}}}
+	c := &Config{Egress: []EgressProfile{hopsProfile(hop)}}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate succeeded, want node.probe to be rejected")
 	}
 }
 

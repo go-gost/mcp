@@ -73,7 +73,8 @@ func (s *server) readEgressResource(_ context.Context, _ *mcp.ReadResourceReques
 }
 
 // nodeResources flattens hop configs into name/address pairs, stripping any
-// userinfo so a topology dump can never leak a credential.
+// userinfo and the whole query string so a topology dump can never leak a
+// credential.
 func nodeResources(hops []*config.HopConfig) []egressNode {
 	var out []egressNode
 	for _, hop := range hops {
@@ -84,10 +85,20 @@ func nodeResources(hops []*config.HopConfig) []egressNode {
 			if node == nil || node.Addr == "" {
 				continue
 			}
-			out = append(out, egressNode{Name: node.Name, Addr: stripUserInfo(node.Addr)})
+			out = append(out, egressNode{Name: node.Name, Addr: stripQuery(stripUserInfo(node.Addr))})
 		}
 	}
 	return out
+}
+
+// stripQuery removes the query string and fragment from an exposed address.
+// Query parameters can carry credentials (?auth=user:pass) and are not part of
+// the address an operator needs for debugging.
+func stripQuery(addr string) string {
+	if i := strings.IndexAny(addr, "?#"); i >= 0 {
+		return addr[:i]
+	}
+	return addr
 }
 
 // stripUserInfo removes credentials from an address when one is embedded.

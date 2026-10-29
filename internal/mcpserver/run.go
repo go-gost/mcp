@@ -76,6 +76,12 @@ func (s *server) handleRun(ctx context.Context, _ *mcp.CallToolRequest, in runIn
 		followRedirects = *in.FollowRedirects
 	}
 
+	release, err := s.acquireCall()
+	if err != nil {
+		return nil, runOutput{}, fmt.Errorf("gost_run: %w", err)
+	}
+	defer release()
+
 	out, err := run.Do(ctx, e, run.Input{
 		URL:             rawURL,
 		Method:          strings.TrimSpace(in.Method),

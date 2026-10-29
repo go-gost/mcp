@@ -219,6 +219,12 @@ func validateHop(profile string, index int, hop *xconfig.HopConfig, nodeNames ma
 		if node.Filter != nil {
 			return fmt.Errorf("%s: filter is not allowed in an egress profile", nwhere)
 		}
+		// A probe makes gost actively test a node before using it. That is a
+		// gost service feature, not a property of a configured egress, and it
+		// would generate network traffic unrelated to the tool call.
+		if node.Probe != nil {
+			return fmt.Errorf("%s: probe is not allowed in an egress profile", nwhere)
+		}
 		if err := rejectMetadata(nwhere, node.Metadata); err != nil {
 			return err
 		}

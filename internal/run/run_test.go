@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -612,6 +614,119 @@ func TestRunConnectTimeoutIsStageTimeout(t *testing.T) {
 	}
 	if !out.Failure.Retryable {
 		t.Error("Retryable = false, want true for a timeout")
+	}
+}
+
+// TestRunProxyFailureIsConnect pins that a proxy 502 and a proxy reset are
+// attributed to the egress dial, not reported as {internal, internal}. The
+// classified code stays internal because the error genuinely carries no more
+// detail, but the stage must say where it happened.
+func TestRunProxyFailureIsConnect(t *testing.T) {
+	t.Run("proxy 502", func(t *testing.T) {
+		_, target := startServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, "denied")
+		}))
+		proxyAddr := testutil.NewHTTPProxy(t, target)
+
+		out, err := Do(context.Background(), proxyEgress(t, proxyAddr), Input{
+			URL:     "http://" + target + "/",
+			Timeout: 2 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if out.OK {
+			t.Fatal("OK = true, want false")
+		}
+		if out.Failure == nil {
+			t.Fatal("Failure = nil, want a connect failure")
+		}
+		if out.Failure.Stage != failure.StageConnect {
+			t.Errorf("Stage = %q, want %q (failure = %+v)", out.Failure.Stage, failure.StageConnect, out.Failure)
+		}
+	})
+
+	t.Run("proxy reset", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}
+		}()
+
+		out, err := Do(context.Background(), proxyEgress(t, ln.Addr().String()), Input{
+			URL:     "http://example.com/",
+			Timeout: 2 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if out.OK {
+			t.Fatal("OK = true, want false")
+		}
+		if out.Failure == nil {
+			t.Fatal("Failure = nil, want a connect failure")
+		}
+		if out.Failure.Stage != failure.StageConnect {
+			t.Errorf("Stage = %q, want %q (failure = %+v)", out.Failure.Stage, failure.StageConnect, out.Failure)
+		}
+	})
+
+	t.Run("unknown port", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+
+		out, err := Do(context.Background(), directEgress(t), Input{
+			URL:     "http://" + addr + "/",
+			Timeout: 2 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		if out.Failure == nil || out.Failure.Stage != failure.StageConnect || out.Failure.Code != failure.CodeRefused {
+			t.Fatalf("Failure = %+v, want {connect, refused}", out.Failure)
+		}
+	})
+}
+
+// TestRecorderConnectKeepsPreciseStage pins the classification rule: the dial
+// operation may only fill in a stage the classifier left as internal.
+func TestRecorderConnectKeepsPreciseStage(t *testing.T) {
+	rec := &recorder{}
+	rec.failedOperation(failure.StageConnect, errors.New("x"))
+
+	for _, tt := range []struct {
+		err       error
+		wantStage failure.Stage
+		code      string
+	}{
+		{&net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}, failure.StageResolve, failure.CodeNXDomain},
+		{errors.New("407 Proxy Authentication Required"), failure.StageProxyAuth, failure.CodeProxyAuthFailed},
+		{x509.UnknownAuthorityError{}, failure.StageTLS, failure.CodeTLSVerify},
+		{fmt.Errorf("dial: %w", egress.ErrNoRoute), failure.StageConnect, failure.CodeNoRoute},
+	} {
+		f := rec.classify(tt.err)
+		if f == nil || f.Code != tt.code || f.Stage != tt.wantStage {
+			t.Fatalf("classify(%v) = %+v, want {%s, %s}", tt.err, f, tt.wantStage, tt.code)
+		}
+	}
+
+	// A timeout is always {timeout, timeout}, whatever the dial was doing.
+	f := rec.classify(context.DeadlineExceeded)
+	if f == nil || f.Stage != failure.StageTimeout || f.Code != failure.CodeTimeout {
+		t.Fatalf("classify(timeout) = %+v, want {timeout, timeout}", f)
 	}
 }
 

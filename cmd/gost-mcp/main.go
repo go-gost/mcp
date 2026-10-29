@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -67,19 +68,39 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if !*check {
-		reg, err := egress.BuildAll(cfg.Egress)
+		logger, closer, err := newLogger(cfg.Log, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "gost-mcp: %v\n", err)
 			return 1
 		}
+		if closer != nil {
+			defer closer.Close()
+		}
+		slog.SetDefault(logger)
+
+		var reg *egress.Registry
+		if *skipInvalid {
+			reg, err = egress.BuildAllSkipping(cfg.Egress, warnf)
+		} else {
+			reg, err = egress.BuildAll(cfg.Egress)
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "gost-mcp: %v\n", err)
+			return 1
+		}
+		defer reg.Close()
 
 		fmt.Fprintf(stderr, "gost-mcp %s: %d egress profile(s) resolved; waiting for MCP messages on stdio\n",
 			version, len(reg.Profiles()))
 
+		wp := wisp.New(cfg.Wisp, nil)
+		defer wp.Close()
+
 		srv := mcpserver.New(cfg, mcpserver.Deps{
 			Egress:         reg,
 			ExposeTopology: *exposeTopology,
-			Wisp:           wisp.New(cfg.Wisp, nil),
+			Wisp:           wp,
+			Logger:         logger,
 			Version:        version,
 		})
 
@@ -94,11 +115,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	if err := printProfiles(stdout, cfg); err != nil {
+	if err := printProfiles(stdout, cfg, *skipInvalid, warnf); err != nil {
 		fmt.Fprintf(stderr, "gost-mcp: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// newLogger builds the process logger from log.level and log.file. MCP owns
+// stdout, so an empty log.file writes to stderr.
+func newLogger(cfg config.LogConfig, stderr io.Writer) (*slog.Logger, io.Closer, error) {
+	w := stderr
+	var closer io.Closer
+	if cfg.File != "" {
+		f, err := os.OpenFile(cfg.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, nil, fmt.Errorf("log.file: %w", err)
+		}
+		w, closer = f, f
+	}
+
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(cfg.Level)) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})), closer, nil
 }
 
 // warnIfGroupReadable warns when the config file may leak credentials to
@@ -117,14 +163,29 @@ func warnIfGroupReadable(path string, warnf func(string, ...any)) {
 	}
 }
 
-// printProfiles prints one line per profile: name, description, hop count,
-// and node count. Addresses and credentials are deliberately omitted.
-func printProfiles(w io.Writer, cfg *config.Config) error {
+// printProfiles builds every profile and prints one line: name, description,
+// hop count, and node count. Building here is what catches a bad node address
+// or an unregistered chain scheme; addresses and credentials are never printed.
+func printProfiles(w io.Writer, cfg *config.Config, skipInvalid bool, warnf func(string, ...any)) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	printed := 0
 	for i := range cfg.Egress {
 		p := &cfg.Egress[i]
+		e, err := egress.Build(p)
+		if err != nil {
+			if skipInvalid {
+				warnf("skipping egress profile: %v", err)
+				continue
+			}
+			return err
+		}
+		e.Close()
 		chain, err := p.ChainConfig()
 		if err != nil {
+			if skipInvalid {
+				warnf("skipping egress profile: %v", err)
+				continue
+			}
 			return err
 		}
 		var nodes int
@@ -135,6 +196,10 @@ func printProfiles(w io.Writer, cfg *config.Config) error {
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
 			p.Name, singleLine(p.Description), plural(len(chain.Hops), "hop"), plural(nodes, "node"))
+		printed++
+	}
+	if printed == 0 {
+		return errors.New("no usable egress profiles")
 	}
 	return tw.Flush()
 }

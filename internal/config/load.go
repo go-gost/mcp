@@ -114,7 +114,7 @@ func loadFile(path string) (*Config, error) {
 	}
 	data, err = expandEnv(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config: %s: %w", resolved, err)
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(data))
@@ -140,28 +140,79 @@ func loadFile(path string) (*Config, error) {
 	return &c, nil
 }
 
-// expandEnv replaces ${NAME} with the environment value. Every reference must
-// resolve: an unset variable is an error, never an empty string, so a missing
-// credential cannot silently turn into an anonymous connection.
+// expandEnv replaces ${NAME} in scalar string values after YAML parsing.
+//
+// Expanding the raw bytes would also rewrite comments and mapping keys, and an
+// expanded value containing YAML metacharacters (":", "#", quotes) could change
+// the document's structure. Walking the node tree keeps comments and keys
+// untouched and lets the marshaller quote the substituted value correctly.
+// Every reference must resolve: an unset variable is an error, never an empty
+// string, so a missing credential cannot silently turn into an anonymous
+// connection.
 func expandEnv(data []byte) ([]byte, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return data, nil
+		}
+		return nil, err
+	}
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return nil, err
+	case extra.Content != nil:
+		return nil, errors.New("multiple YAML documents are not supported")
+	}
+
 	var missing []string
 	seen := make(map[string]bool)
-	out := envRefPattern.ReplaceAllFunc(data, func(m []byte) []byte {
-		name := string(m[2 : len(m)-1])
-		v, ok := os.LookupEnv(name)
-		if !ok {
-			if !seen[name] {
-				seen[name] = true
-				missing = append(missing, name)
+	expand := func(s string) string {
+		return envRefPattern.ReplaceAllStringFunc(s, func(m string) string {
+			name := m[2 : len(m)-1]
+			v, ok := os.LookupEnv(name)
+			if !ok {
+				if !seen[name] {
+					seen[name] = true
+					missing = append(missing, name)
+				}
+				return m
 			}
-			return m
-		}
-		return []byte(v)
-	})
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("config: undefined environment variable(s): %s", strings.Join(missing, ", "))
+			return v
+		})
 	}
-	return out, nil
+	expandNode(&doc, expand)
+
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("undefined environment variable(s): %s", strings.Join(missing, ", "))
+	}
+	return yaml.Marshal(&doc)
+}
+
+// expandNode applies expand to string scalar values only. Mapping keys and
+// comments are not scalar values here, so neither is rewritten.
+func expandNode(node *yaml.Node, expand func(string) string) {
+	if node == nil {
+		return
+	}
+	switch node.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for _, child := range node.Content {
+			expandNode(child, expand)
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			expandNode(node.Content[i+1], expand)
+		}
+	case yaml.AliasNode:
+		expandNode(node.Alias, expand)
+	case yaml.ScalarNode:
+		if node.Tag == "!!str" {
+			node.Value = expand(node.Value)
+		}
+	}
 }
 
 func (c *Config) applyDefaults() {

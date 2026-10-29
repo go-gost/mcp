@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/go-gost/mcp/internal/config"
@@ -37,6 +38,33 @@ func BuildAll(profiles []config.EgressProfile) (*Registry, error) {
 	return r, nil
 }
 
+// BuildAllSkipping builds every profile and drops the ones that fail,
+// reporting each through warnf. It is the startup counterpart of
+// --skip-invalid for errors only visible after parsing (an unregistered chain
+// scheme, a bad node address).
+func BuildAllSkipping(profiles []config.EgressProfile, warnf func(string, ...any)) (*Registry, error) {
+	if warnf == nil {
+		warnf = func(string, ...any) {}
+	}
+	r := &Registry{byName: make(map[string]*Egress, len(profiles))}
+	for i := range profiles {
+		e, err := Build(&profiles[i])
+		if err != nil {
+			warnf("skipping egress profile: %v", err)
+			continue
+		}
+		if _, ok := r.byName[e.Name]; ok {
+			return nil, fmt.Errorf("egress %q: duplicate profile name", e.Name)
+		}
+		r.byName[e.Name] = e
+		r.order = append(r.order, e.Name)
+	}
+	if len(r.order) == 0 {
+		return nil, fmt.Errorf("egress: no usable profiles")
+	}
+	return r, nil
+}
+
 // Get returns the named egress.
 func (r *Registry) Get(name string) (*Egress, bool) {
 	if r == nil {
@@ -57,4 +85,18 @@ func (r *Registry) Profiles() []Profile {
 		out = append(out, Profile{Name: e.Name, Description: e.Description})
 	}
 	return out
+}
+
+// Close releases every built chain. It is safe to call more than once.
+func (r *Registry) Close() error {
+	if r == nil {
+		return nil
+	}
+	var errs []error
+	for _, name := range r.order {
+		if e := r.byName[name]; e != nil {
+			errs = append(errs, e.Close())
+		}
+	}
+	return errors.Join(errs...)
 }

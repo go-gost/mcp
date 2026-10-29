@@ -299,7 +299,7 @@ func runConnect(ctx context.Context, e *egress.Egress, p plan) (net.Conn, Stage,
 	}
 	detail["nodes"] = routeNodeNames(route)
 
-	conn, err := dialRoute(ctx, route, p.network, p.addr)
+	conn, err := egress.Dial(ctx, route, p.network, p.addr)
 	if err != nil {
 		f := classifyOp(failure.StageConnect, err)
 		return nil, Stage{Name: "connect", MS: elapsedMS(start), Detail: detail, Error: f}, route
@@ -343,17 +343,28 @@ func runTLS(ctx context.Context, conn net.Conn, p plan) (net.Conn, Stage) {
 
 // runHTTP sends one HEAD request over the established connection. Any status
 // is an answer; only a transport error fails the stage.
+//
+// The request is built with http.NewRequest and written with Request.Write, so
+// a target that slipped past validation cannot inject a second request through
+// CRLF in the path or Host header.
 func runHTTP(ctx context.Context, conn net.Conn, p plan) Stage {
 	start := time.Now()
 	detail := map[string]any{"path": p.path}
 	setDeadline(ctx, conn)
 
-	req := fmt.Sprintf("HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: gost-mcp\r\nAccept: */*\r\nConnection: close\r\n\r\n", p.path, p.addr)
-	if _, err := io.WriteString(conn, req); err != nil {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+p.addr+p.path, nil)
+	if err != nil {
+		return Stage{Name: "http", MS: elapsedMS(start), Detail: detail, Error: classifyOp(failure.StageHTTP, err)}
+	}
+	req.Header.Set("User-Agent", "gost-mcp")
+	req.Header.Set("Accept", "*/*")
+	req.Close = true
+
+	if err := req.Write(conn); err != nil {
 		return Stage{Name: "http", MS: elapsedMS(start), Detail: detail, Error: classifyOp(failure.StageHTTP, err)}
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodHead})
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
 		return Stage{Name: "http", MS: elapsedMS(start), Detail: detail, Error: classifyOp(failure.StageHTTP, err)}
 	}
@@ -449,19 +460,31 @@ func runRead(ctx context.Context, conn net.Conn, in Input) Stage {
 	return Stage{Name: "read", OK: true, MS: elapsedMS(start), Detail: detail}
 }
 
+// buildEgress is egress.Build, swappable in tests so they can observe the
+// temporary per-prefix egresses are closed.
+var buildEgress = egress.Build
+
 // probePrefixes dials each cumulative prefix, starting with an explicit direct
-// probe, and stops at the first failure. Every prefix builds a fresh egress so
-// node selection cannot be shared with an earlier probe.
+// probe, and stops at the first failure.
+//
+// The direct baseline is real traffic leaving from this host, so it is bounded
+// to min(2s, 20% of the remaining budget). Its failure does not stop the hop
+// probes: a host that cannot reach the target directly is exactly the case an
+// egress exists for. Every prefix builds a fresh egress so node selection
+// cannot be shared with an earlier probe; each temporary egress is closed.
 func probePrefixes(ctx context.Context, e *egress.Egress, p plan) []PrefixResult {
 	results := make([]PrefixResult, 0, len(e.HopConfigs())+1)
 
-	direct, err := egress.Build(&config.EgressProfile{Name: e.Name, Chain: []string{}})
+	direct, err := buildEgress(&config.EgressProfile{Name: e.Name, Chain: []string{}})
 	if err != nil {
 		return results
 	}
-	pr := probeOne(ctx, direct, p, []string{"direct"}, nil)
+	dctx, cancel := context.WithTimeout(ctx, baselineTimeout(ctx))
+	pr := probeOne(dctx, direct, p, []string{"direct"}, nil)
+	cancel()
+	direct.Close()
 	results = append(results, pr)
-	if !pr.OK {
+	if ctx.Err() != nil {
 		return results
 	}
 
@@ -472,7 +495,7 @@ func probePrefixes(ctx context.Context, e *egress.Egress, p plan) []PrefixResult
 		prefix = append(prefix, hop)
 		path = append(path, hopName(hop, i))
 
-		tmp, err := egress.Build(&config.EgressProfile{Name: e.Name, Hops: prefix})
+		tmp, err := buildEgress(&config.EgressProfile{Name: e.Name, Hops: prefix})
 		if err != nil {
 			results = append(results, PrefixResult{
 				Path:     append([]string(nil), path...),
@@ -484,6 +507,7 @@ func probePrefixes(ctx context.Context, e *egress.Egress, p plan) []PrefixResult
 		}
 
 		pr = probeOne(ctx, tmp, p, append([]string(nil), path...), hop)
+		tmp.Close()
 		results = append(results, pr)
 		if !pr.OK {
 			return results
@@ -491,6 +515,24 @@ func probePrefixes(ctx context.Context, e *egress.Egress, p plan) []PrefixResult
 	}
 
 	return results
+}
+
+// baselineTimeout bounds the direct probe: min(2s, 20% of the remaining call
+// budget). A tiny budget gets a tiny baseline rather than consuming it all.
+func baselineTimeout(ctx context.Context) time.Duration {
+	const maxBaseline = 2 * time.Second
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return maxBaseline
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	if fifth := remaining / 5; fifth < maxBaseline {
+		return fifth
+	}
+	return maxBaseline
 }
 
 // probeOne connects once through e without writing a payload.
@@ -513,7 +555,7 @@ func probeOne(ctx context.Context, e *egress.Egress, p plan, path []string, last
 	}
 	res.ServedBy = routeLastHopNames(route, []*xconfig.HopConfig{lastHop})
 
-	conn, err := dialRoute(ctx, route, network, addr)
+	conn, err := egress.Dial(ctx, route, network, addr)
 	if err != nil {
 		f := classifyOp(failure.StageConnect, err)
 		res.Stage = "connect"
@@ -543,15 +585,27 @@ func attribution(prefixes []PrefixResult, e *egress.Egress, d diagnosis) *Attrib
 	}
 
 	if d.stage == "connect" {
+		// The direct baseline is context, not a hop: attribute a connect
+		// failure to the first failing hop prefix. Fall back to direct only
+		// when it is the sole probe result.
+		found := false
 		for _, pr := range prefixes {
-			if pr.OK {
+			if pr.OK || len(pr.Path) == 1 && pr.Path[0] == "direct" {
 				continue
 			}
 			path = pr.Path
 			served = pr.ServedBy
 			stage = "connect"
 			code = pr.Code
+			found = true
 			break
+		}
+		if !found && len(prefixes) == 1 && !prefixes[0].OK &&
+			len(prefixes[0].Path) == 1 && prefixes[0].Path[0] == "direct" {
+			path = prefixes[0].Path
+			served = prefixes[0].ServedBy
+			stage = "connect"
+			code = prefixes[0].Code
 		}
 	}
 	if served == nil {
@@ -628,46 +682,6 @@ func routeLastHopNames(route chain.Route, hops []*xconfig.HopConfig) []string {
 		out = append(out, node.Name)
 	}
 	return out
-}
-
-// dialRoute bounds a route dial with ctx.
-//
-// gost's proxy connectors perform their CONNECT handshake inside Route.Dial
-// and do not observe context cancellation once the TCP connect succeeded, so a
-// blackholed proxy would otherwise block past the call budget. The dial is
-// therefore run in a goroutine; if the budget expires first, the result is
-// abandoned and any connection it later returns is closed. A permanently
-// unresponsive peer can retain that goroutine until the OS gives up on the
-// socket, which is preferable to blocking the trace indefinitely.
-func dialRoute(ctx context.Context, route chain.Route, network, addr string) (net.Conn, error) {
-	if route == nil {
-		return nil, egress.ErrNoRoute
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	type result struct {
-		conn net.Conn
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		conn, err := route.Dial(ctx, network, addr)
-		ch <- result{conn: conn, err: err}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.conn, r.err
-	case <-ctx.Done():
-		go func() {
-			if r := <-ch; r.conn != nil {
-				r.conn.Close()
-			}
-		}()
-		return nil, ctx.Err()
-	}
 }
 
 // classifyOp classifies err and overrides the stage with the operation that
@@ -755,6 +769,9 @@ func parseTarget(raw, mode, resolver string) (plan, error) {
 	target := strings.TrimSpace(raw)
 	if target == "" {
 		return plan{}, errors.New("trace: target is required")
+	}
+	if hasControl(target) {
+		return plan{}, errors.New("trace: target must not contain control characters")
 	}
 
 	scheme, rest := splitScheme(target)
@@ -861,8 +878,23 @@ func parseTarget(raw, mode, resolver string) (plan, error) {
 		p.network = "udp"
 	}
 	p.path = path
+	if hasControl(p.host) || hasControl(p.path) {
+		return plan{}, errors.New("trace: host and path must not contain control characters")
+	}
 
 	return p, nil
+}
+
+// hasControl reports whether s contains an ASCII control character, including
+// CR and LF. Request-splitting attempts are rejected before a connection is
+// opened rather than escaped later.
+func hasControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // splitScheme returns a known target scheme and the remainder after "://". It
@@ -944,7 +976,7 @@ func fetchIdentity(ctx context.Context, e *egress.Egress, rawURL string) (map[st
 			if err != nil {
 				return nil, err
 			}
-			return dialRoute(ctx, route, network, addr)
+			return egress.Dial(ctx, route, network, addr)
 		},
 	}
 	defer tr.CloseIdleConnections()

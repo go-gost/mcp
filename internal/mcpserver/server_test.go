@@ -18,6 +18,7 @@ import (
 	"github.com/go-gost/mcp/internal/egress"
 	"github.com/go-gost/mcp/internal/testutil"
 	"github.com/go-gost/mcp/internal/wisp"
+	xconfig "github.com/go-gost/x/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -495,26 +496,68 @@ func TestToolLimits(t *testing.T) {
 	}
 }
 
-func TestTraceConcurrencyCap(t *testing.T) {
-	s := &server{cfg: &config.Config{}, traceSem: make(chan struct{}, 2)}
+// TestNodeResourcesOmitsQuery pins that an exposed address drops the whole
+// query string: credentials in ?auth=... must never reach the model, even
+// though the host itself is shown with --expose-topology.
+func TestNodeResourcesOmitsQuery(t *testing.T) {
+	nodes := nodeResources([]*xconfig.HopConfig{{
+		Name: "hop-0",
+		Nodes: []*xconfig.NodeConfig{{
+			Name: "a",
+			Addr: "socks5://alice:hunter2@proxy.example.com:1080?auth=alice:hunter2&interface=eth0",
+		}},
+	}})
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v, want one", nodes)
+	}
+	addr := nodes[0].Addr
+	if addr != "socks5://proxy.example.com:1080" {
+		t.Errorf("Addr = %q, want the address without userinfo or query", addr)
+	}
+	for _, leak := range []string{"alice", "hunter2", "auth=", "?"} {
+		if strings.Contains(addr, leak) {
+			t.Errorf("Addr %q leaks %q", addr, leak)
+		}
+	}
+}
 
-	release1, err := s.acquireTrace()
+// TestWispLabelIsCapped pins the bound on a free-text label.
+func TestWispLabelIsCapped(t *testing.T) {
+	fake := newFakeProvisioner()
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+
+	res := callWisp(t, cs, map[string]any{
+		"local": "127.0.0.1:3000",
+		"label": strings.Repeat("x", 300),
+	})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+	if got := len(fake.lastRequest(t).Label); got != maxWispLabel {
+		t.Errorf("label length = %d, want %d", got, maxWispLabel)
+	}
+}
+
+func TestCallConcurrencyCap(t *testing.T) {
+	s := &server{cfg: &config.Config{}, callSem: make(chan struct{}, 2)}
+
+	release1, err := s.acquireCall()
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	release2, err := s.acquireTrace()
+	release2, err := s.acquireCall()
 	if err != nil {
 		t.Fatalf("second acquire: %v", err)
 	}
 
-	if _, err := s.acquireTrace(); err == nil {
+	if _, err := s.acquireCall(); err == nil {
 		t.Fatal("third acquire succeeded, want a clear busy error")
 	} else if !strings.Contains(err.Error(), "already running") {
 		t.Errorf("busy error = %q", err)
 	}
 
 	release1()
-	if _, err := s.acquireTrace(); err != nil {
+	if _, err := s.acquireCall(); err != nil {
 		t.Errorf("acquire after release: %v", err)
 	}
 	release2()
@@ -588,6 +631,8 @@ func (f *fakeProvisioner) List() []wisp.Lease {
 	sort.Slice(out, func(i, j int) bool { return out[i].Handle < out[j].Handle })
 	return out
 }
+
+func (f *fakeProvisioner) Close() {}
 
 // lastRequest returns the most recent Provision request.
 func (f *fakeProvisioner) lastRequest(t *testing.T) wisp.Request {

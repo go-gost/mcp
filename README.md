@@ -150,7 +150,7 @@ Notes:
 - The `resolve` stage is local and informational. With SOCKS5/HTTP CONNECT the exit resolves the name, so a local DNS failure does not prove the chain fails.
 - `mode=dns` sends an explicit query **through the egress** to `resolver` (default: the first nameserver in `/etc/resolv.conf`).
 - Prefix probing connects only and stops at the first failure. The full chain then runs the complete stage test. With a multi-node hop, the probe and the final attempt may use different nodes, so attribution is best-effort and each prefix reports `served_by` (node names, never addresses).
-- The **first prefix is always a direct baseline**: `gost_trace` dials the target from *this host*, without the selected egress, and reports it as `path: ["direct"]`. That baseline is real traffic leaving from here even when a proxy profile is selected, so it also reveals which hop is at fault. Pass `prefix: false` when even that single direct connection is not acceptable.
+- The **first prefix is a direct baseline**: `gost_trace` dials the target from *this host*, without the selected egress, and reports it as `path: ["direct"]`. That baseline is real traffic leaving from here even when a proxy profile is selected. It is bounded to min(2s, 20% of the call budget), its failure does not stop the hop probes, and a connect failure is attributed to the first failing *hop* prefix (never to `direct` unless it is the only probe result). Pass `prefix: false` when even that single direct connection is not acceptable.
 - `timeout_ms` is a budget for the whole call. A timeout returns the prefixes that completed plus `ok=false`.
 - An empty route is `code=no_route`, never a direct dial.
 - `identity` makes one extra request through the full chain to `gost_trace.identity_url` (HTTPS by default) and reports `{ip, family, country, asn, org}` when the endpoint provides them.
@@ -173,7 +173,7 @@ Notes:
 {
   "ok": true,
   "url": "https://134c714b65d54a4f.gost.run",
-  "handle": "w_7f3c2a1b9d40",
+  "handle": "7f3c2a1b9d40a1b2",
   "local": "127.0.0.1:3000",
   "expires_at": "2026-10-29T12:15:00Z",
   "state": "active",
@@ -181,31 +181,32 @@ Notes:
 }
 ```
 
-Arguments: `local` is required and must be a literal `host:port` that resolves entirely inside `gost_wisp.allow`. Optional: `ttl_s` (default 900, capped by `gost_wisp.max_ttl`), `label` (free text for logs; never part of the URL), `verify` (default true, one GET through the public URL).
+Arguments: `local` is required and must be a `host:port` that resolves entirely inside `gost_wisp.allow`. The host may be an IP literal or a DNS name such as `localhost`; it is resolved once, every address must be allowed, and the first IPv4 address (else the first IPv6) is pinned. Optional: `ttl_s` (default 900, capped by `gost_wisp.max_ttl`), `label` (free text for logs, capped at 128 bytes; never part of the URL), `verify` (default true, one GET through the public URL).
 
 Notes:
 
 - The URL is `https://<relay-label>.<gost_wisp.domain>`. The relay is configuration, never a tool argument.
-- The relay may re-bind a tunnel and issue a new label. Read `gost-mcp://leases` for the current URL instead of reusing a stale one. States are `active`, `rebound`, and `expired`.
-- `verify` only proves the tunnel at creation time; any HTTP status, including 401 or 404, means the tunnel works.
+- The handle is 16 lowercase hex characters, opaque, and unrelated to the public label.
+- The relay may re-bind a tunnel and issue a new label. Read `gost-mcp://leases` for the current URL instead of reusing a stale one. States are `active`, `rebound`, `expired`, and `dead` (the relay service stopped unexpectedly; its slot is free and the record remains for reporting).
+- `verify` only proves the tunnel at creation time; any HTTP status, including 401 or 404, means the tunnel works. It does not follow a redirect and ignores environment proxies.
 - Leases are in memory. Process exit closes them all.
 
 ### `gost_unwisp`
 
 ```json
-{"tool": "gost_unwisp", "arguments": {"handle": "w_7f3c2a1b9d40"}}
+{"tool": "gost_unwisp", "arguments": {"handle": "7f3c2a1b9d40a1b2"}}
 ```
 
 ```json
 {"ok": true, "released": true, "url": "https://134c714b65d54a4f.gost.run"}
 ```
 
-An unknown, expired, or already released handle returns `released=false` rather than an error.
+An unknown, expired, or dead handle returns `released=false` rather than an error.
 
 ### Resources
 
 - `gost-mcp://egress` — configured profiles as `{name, description}`. Node addresses appear only with `--expose-topology`, and credentials are stripped.
-- `gost-mcp://leases` — leases as `{handle, url, local, label, state, expires_at}`, including expired records retained for reporting. Read this after a re-bind.
+- `gost-mcp://leases` — leases as `{handle, url, local, label, state, expires_at}`, including expired and dead records retained for reporting. Read this after a re-bind.
 
 ## Configuration
 
@@ -238,11 +239,11 @@ egress:
       - name: hop-0
         selector: { strategy: round }
         nodes:
-          - { name: a, addr: "http://10.0.0.1:8080" }
-          - { name: b, addr: "http://10.0.0.2:8080" }
+          - { name: a, addr: "10.0.0.1:8080", connector: { type: http } }
+          - { name: b, addr: "10.0.0.2:8080", connector: { type: http } }
       - name: hop-1
         nodes:
-          - { name: c, addr: "socks5://10.0.1.5:1080" }
+          - { name: c, addr: "10.0.1.5:1080", connector: { type: socks5 } }
 
   - name: wifi
     description: "Force wlan0, to compare with the cellular exit"
@@ -266,7 +267,7 @@ gost_wisp:
   allow: ["127.0.0.0/8", "::1/128"]
 
 log:
-  level: info          # logs go to stderr; stdout is the MCP channel
+  level: info          # gost-mcp's own logs; stdout is the MCP channel
 ```
 
 `gost-mcp.example.yml` in this repository is the same shape with commented credentials; the Docker image installs it as `/etc/gost-mcp/gost-mcp.yml`.
@@ -275,10 +276,11 @@ log:
 
 - A profile needs a unique `name` matching `[a-z0-9_-]{1,32}` and a non-blank `description`.
 - Set exactly one of `chain` or `hops`.
-  - `chain` is a list of gost `-F` URIs; **each entry is one hop**.
-  - `hops` is the full hop schema, for a pool of nodes in one hop.
+  - `chain` is a list of gost `-F` URIs; **each entry is one hop**. A URI scheme must be a connector or dialer this build registered (`http`, `https`, `socks5`, `ss`, `tunnel+wss`, ...); an unknown scheme such as `grpc://` or an alias such as `socks5h://` is rejected instead of falling back to HTTP.
+  - `hops` is the full hop schema, for a pool of nodes in one hop. An explicit node's `addr` is `host:port` with no `://`; the protocol lives in `connector: { type: http|socks5|... }`. A missing connector type means HTTP. `direct` and `virtual` connectors are rejected because they skip the egress.
   - `chain: []` is the explicit direct profile. There is no implicit direct egress.
 - Hop- and node-level `bypass`, `bypasses`, `matcher`, and `filter` are rejected. They can make gost skip a hop and eventually dial direct, which would turn a configured egress into a hidden bypass. Use a separate `direct` profile.
+- `node.probe` is rejected: an egress profile must not generate active probe traffic unrelated to a tool call.
 - Dynamic node sources (`file`, `redis`, `http`, `plugin`), `reload`, and named `resolver`/`hosts` components are rejected. Nodes must be static for the process lifetime.
 - File-level `services`, `authers`, `resolvers`, `hosts`, `plugins`, and `sd` are rejected rather than silently ignored.
 - Chain query parameters `bypass`, `bypasses`, `matcher`, `filter`, `resolver`, `hosts`, and `sd` are rejected.
@@ -296,17 +298,18 @@ log:
 | `gost_wisp.max_ttl` | `1h` | Range `1s..24h`; a larger `ttl_s` is clamped. |
 | `gost_wisp.max_leases` | `4` | Range `1..64`; concurrent live leases. |
 | `gost_wisp.allow` | `127.0.0.0/8`, `::1/128` | IPs or CIDR prefixes. A target must resolve entirely inside the list. |
-| `log.level` | `info` | Accepted and validated (`debug`, `info`, `warn`, `error`); reserved for log wiring. |
-| `log.file` | empty | Reserved; logs always go to stderr, because stdout is reserved for MCP frames. |
+| `log.level` | `info` | `debug`, `info`, `warn`, or `error`; controls gost-mcp's own logger. |
+| `log.file` | empty | Append gost-mcp logs to this file; empty writes to stderr. stdout is reserved for MCP frames. Embedded gost components keep their own logger and do not necessarily write here. |
 
 Durations accept Go syntax (`30s`, `1h`) or a bare number of seconds. Sizes accept a byte count or `1MiB`-style strings.
 
 ## `${ENV}` expansion
 
-`${NAME}` references are expanded in **every string value** before YAML parsing. Only the braced form is expanded, so a bare `$` in a password survives.
+`${NAME}` references in **scalar string values** are expanded after YAML parsing. Only the braced form is expanded, so a bare `$` in a password survives.
 
 - An unset variable is a **startup error**, never an empty string. A missing credential cannot silently become an anonymous connection.
-- Expansion happens before YAML parsing, so a `${NAME}` in a **comment** is expanded too and an unset one still fails. Avoid `${...}` in comments, or define the variable.
+- Keys and comments are not values, so `${...}` in them is left untouched and never fails startup.
+- Substitution happens on the parsed value, so a password containing `"`, `#`, or `:` cannot break the YAML structure. URL metacharacters still need percent-encoding inside a `chain:` URI.
 - Put credentials in the MCP client's `environment`/`env` block and reference them here. Do not commit them to the YAML.
 
 ## Validate the configuration
@@ -320,7 +323,7 @@ direct  Host direct, no proxy            0 hops  0 nodes
 jp      Tokyo residential exit (SOCKS5)  1 hop   1 node
 ```
 
-`--check` parses, expands, and validates every profile, then prints name, description, hop count, and node count — never addresses or credentials. It exits `0` when the file is valid and `1` when it is not. It also warns when the file is group- or world-readable, because it may contain credentials:
+`--check` parses, expands, validates, and **builds** every profile, then prints name, description, hop count, and node count — never addresses or credentials. Building is what catches an unregistered chain scheme or a bad node address, not just a syntax error. It exits `0` when the file is valid and `1` when it is not. It also warns when the file is group- or world-readable, because it may contain credentials:
 
 ```
 gost-mcp: warning: /etc/gost-mcp/gost-mcp.yml is accessible by group or others (0644); it may contain credentials, use 0600
@@ -371,8 +374,8 @@ Read this before pointing the server at anything real.
 - **There is no `env:` header indirection.** `gost_run.headers` values are literal. A secret placed in a header is visible to the model and in the request. This is deliberate: header-to-server-secret indirection would let a prompt-injected model exfiltrate a credential to an arbitrary host.
 - **Credentials belong in the MCP client's environment, not the YAML.** Reference them as `${JP_PASS}`. If the file does contain credentials, `chmod 0600` it; `--check` and startup warn when it is group- or world-readable.
 - **No hidden direct egress in the requested path.** `egress` is required, an unknown name is an error, and profiles cannot use `bypass`/`matcher`/`filter` to skip a hop: the requested egress never falls back to a direct dial. One connection is direct on purpose — the [`gost_trace` prefix baseline](#gost_trace), which always dials from this host. Pass `prefix: false` if that baseline is not acceptable.
-- **No network listener in v0.** MCP uses stdio, so there is no port to authenticate. stdout carries protocol frames; all logs and warnings go to stderr.
-- **Leases are logged and bounded.** A publication logs label, target, URL, handle, and expiry to stderr; a release logs the handle, URL, and `released` flag. Neither includes credentials or node addresses. TTL, lease count, and target allow-list are enforced.
+- **No network listener in v0.** MCP uses stdio, so there is no port to authenticate. stdout carries protocol frames; gost-mcp's own logs and warnings go to stderr or `log.file`.
+- **Leases are logged and bounded.** A publication logs label, target, URL, handle, and expiry; a release logs the handle, URL, and `released` flag. Neither includes credentials or node addresses. TTL, lease count, and target allow-list are enforced.
 
 ## Build and test
 
@@ -407,7 +410,7 @@ The version comes from `-ldflags "-X main.version=v0.1.0"`; a plain `go build` r
 | `ok=false`, `stage=proxy_auth`, `code=proxy_auth_failed` | Wrong proxy credentials; check `${...}` expansion. |
 | `gost_wisp: target not allowed` | The target resolved outside `gost_wisp.allow`. |
 | `gost_wisp: max leases reached` | Release a lease with `gost_unwisp` or raise `max_leases`. |
-| A published URL stops working | The lease expired, the process restarted, or the relay re-bound it; read `gost-mcp://leases`. |
+| A published URL stops working | The lease expired, the relay service died (`state=dead`), the process restarted, or the relay re-bound it; read `gost-mcp://leases`. |
 
 ## License
 

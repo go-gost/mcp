@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"sync/atomic"
 
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/logger"
@@ -33,6 +35,7 @@ type Egress struct {
 	chain    chain.Chainer
 	hops     []*xconfig.HopConfig
 	hopCount int
+	closed   atomic.Bool
 	// lastHopNodes holds the names of the last configured hop's nodes. gost's
 	// parser preserves node names (Node.Copy copies them), so a returned route
 	// reaching the last hop contains at least one of these names.
@@ -53,6 +56,9 @@ func Build(p *config.EgressProfile) (*Egress, error) {
 
 	cfg, err := p.ChainConfig()
 	if err != nil {
+		return nil, err
+	}
+	if err := validateConnections(p, cfg); err != nil {
 		return nil, err
 	}
 
@@ -161,6 +167,30 @@ func (e *Egress) HopConfigs() []*xconfig.HopConfig {
 		return nil
 	}
 	return e.hops
+}
+
+// Close releases the chain's probe goroutines and node resources. It is
+// idempotent; a direct profile has nothing to close.
+func (e *Egress) Close() error {
+	if e == nil {
+		return nil
+	}
+	if !e.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if e.chain == nil {
+		return nil
+	}
+	if c, ok := e.chain.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// Closed reports whether Close has been called. It lets callers (and tests)
+// verify that a temporary egress was released.
+func (e *Egress) Closed() bool {
+	return e == nil || e.closed.Load()
 }
 
 // defaultLogger returns gost's global logger, installing a discard logger when

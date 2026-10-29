@@ -141,11 +141,13 @@ func isCertificateError(err error) bool {
 	return errors.As(err, &verify)
 }
 
-// isTLSMessage matches the "tls:" prefix. It scans the whole message because
-// net/http wraps handshake errors in *url.Error, which prefixes the request
-// ("Get \"https://...\": tls: ...").
+// isTLSMessage matches the "tls: " token rather than any substring containing
+// "tls:". net/http wraps handshake errors in *url.Error, which prefixes the
+// request ("Get \"https://...\": tls: ..."), so a token at the start or after a
+// space is the shape to match; "notls:" must not be classified as TLS.
 func isTLSMessage(err error) bool {
-	return strings.Contains(err.Error(), "tls:")
+	msg := err.Error()
+	return strings.HasPrefix(msg, "tls: ") || strings.Contains(msg, " tls: ")
 }
 
 // isProxyAuthError matches the HTTP proxy status line and gosocks5's

@@ -26,11 +26,11 @@ const (
 	maxRunMaxBytes  = 8 << 20 // 8 MiB
 	maxTraceTimeout = 60 * time.Second
 
-	// maxConcurrentTraces bounds abandoned dial goroutines and file
-	// descriptors: trace.Run cannot cancel a CONNECT handshake that a
-	// blackholed proxy is holding, so unchecked concurrent traces could
+	// maxConcurrentCalls bounds abandoned dial goroutines and file descriptors
+	// across all tools: egress.Dial cannot cancel a CONNECT handshake that a
+	// blackholed proxy is holding, so unchecked concurrent calls could
 	// accumulate goroutines until the peer times out.
-	maxConcurrentTraces = 8
+	maxConcurrentCalls = 16
 )
 
 // Deps are the runtime dependencies of the MCP server.
@@ -64,8 +64,8 @@ type server struct {
 	cfg  *config.Config
 	deps Deps
 
-	// traceSem limits simultaneous gost_trace calls.
-	traceSem chan struct{}
+	// callSem limits simultaneous tool calls across run and trace.
+	callSem chan struct{}
 }
 
 // stderrLogger is the default publication record sink. stdout carries MCP
@@ -92,9 +92,9 @@ func New(cfg *config.Config, deps Deps) *mcp.Server {
 		deps.Logger = stderrLogger
 	}
 	s := &server{
-		cfg:      cfg,
-		deps:     deps,
-		traceSem: make(chan struct{}, maxConcurrentTraces),
+		cfg:     cfg,
+		deps:    deps,
+		callSem: make(chan struct{}, maxConcurrentCalls),
 	}
 
 	srv := mcp.NewServer(&mcp.Implementation{
@@ -144,14 +144,15 @@ func (s *server) profileNames() string {
 	return strings.Join(names, ", ")
 }
 
-// acquireTrace takes one of the trace slots. It never blocks: a full server
-// reports back instead of queueing an unbounded number of abandoned dials.
-func (s *server) acquireTrace() (release func(), err error) {
+// acquireCall takes one of the shared tool-call slots. It never blocks: a full
+// server reports back instead of queueing an unbounded number of abandoned
+// dials.
+func (s *server) acquireCall() (release func(), err error) {
 	select {
-	case s.traceSem <- struct{}{}:
-		return func() { <-s.traceSem }, nil
+	case s.callSem <- struct{}{}:
+		return func() { <-s.callSem }, nil
 	default:
-		return nil, fmt.Errorf("gost_trace: %d traces are already running; retry when one completes", cap(s.traceSem))
+		return nil, fmt.Errorf("%d tool calls are already running; retry when one completes", cap(s.callSem))
 	}
 }
 

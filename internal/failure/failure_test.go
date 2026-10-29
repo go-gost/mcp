@@ -98,6 +98,19 @@ func TestClassify(t *testing.T) {
 			wantCode:  CodeTLSHandshake,
 		},
 		{
+			name:      "remote tls alert",
+			err:       errors.New("remote error: tls: bad certificate"),
+			wantStage: StageTLS,
+			wantCode:  CodeTLSHandshake,
+		},
+		{
+			// "notls:" is not the "tls: " token; it must not be re-staged.
+			name:      "notls is not tls",
+			err:       errors.New("notls: this is a different protocol"),
+			wantStage: StageInternal,
+			wantCode:  CodeInternal,
+		},
+		{
 			name:      "http proxy 407",
 			err:       errors.New("407 Proxy Authentication Required"),
 			wantStage: StageProxyAuth,

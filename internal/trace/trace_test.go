@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -42,8 +44,9 @@ func chainEgress(t *testing.T, addrs ...string) *egress.Egress {
 		hops[i] = &xconfig.HopConfig{
 			Name: fmt.Sprintf("hop-%d", i),
 			Nodes: []*xconfig.NodeConfig{{
-				Name: fmt.Sprintf("%c", 'a'+i),
-				Addr: addr,
+				Name:      fmt.Sprintf("%c", 'a'+i),
+				Addr:      addr,
+				Connector: &xconfig.ConnectorConfig{Type: "http"},
 			}},
 		}
 	}
@@ -583,8 +586,204 @@ func TestTraceDNSTruncatedRetriesTCP(t *testing.T) {
 	}
 }
 
-// startDNSServer runs a UDP DNS server that answers A queries for any name
-// with 1.2.3.4 and returns NODATA for AAAA.
+// TestTraceRejectsControlCharacters pins the request-splitting guard: a target
+// with CRLF is an argument error, not a request that reaches the server.
+func TestTraceRejectsControlCharacters(t *testing.T) {
+	for _, target := range []string{
+		"example.com:80\r\nX-Injected: yes",
+		"http://example.com/\r\nX-Injected: yes",
+		"http://example.com/a\nb",
+		"example.com:80\x00",
+	} {
+		if _, err := Run(context.Background(), directEgress(t), Input{
+			Target:  target,
+			Mode:    "http",
+			Prefix:  false,
+			Timeout: time.Second,
+		}); err == nil {
+			t.Errorf("Run(%q) succeeded, want a control-character rejection", target)
+		}
+	}
+}
+
+// TestTraceDirectBaselineFailureDoesNotStopHops pins that the direct baseline
+// is context only: a target this host cannot resolve may still be reachable
+// through the egress, and the hop probes must run.
+func TestTraceDirectBaselineFailureDoesNotStopHops(t *testing.T) {
+	target, _ := startTarget(t)
+	proxyAddr := testutil.NewHTTPProxyRewriting(t, target)
+
+	e, err := egress.Build(&config.EgressProfile{
+		Name:  "via-proxy",
+		Chain: []string{"http://" + proxyAddr},
+	})
+	if err != nil {
+		t.Fatalf("build egress: %v", err)
+	}
+
+	rep, err := Run(context.Background(), e, Input{
+		Target:  "name-that-does-not-resolve.invalid:80",
+		Mode:    "http",
+		Prefix:  true,
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !rep.OK {
+		t.Fatalf("OK = false, failure = %+v", rep.Failure)
+	}
+	if len(rep.Prefixes) < 2 {
+		t.Fatalf("Prefixes = %+v, want the direct baseline and the hop probe", rep.Prefixes)
+	}
+	if got := rep.Prefixes[0]; got.OK || !samePath(got.Path, []string{"direct"}) {
+		t.Errorf("prefixes[0] = %+v, want the direct baseline to fail", got)
+	}
+	if got := rep.Prefixes[1]; !got.OK || !samePath(got.Path, []string{"hop-0"}) {
+		t.Errorf("prefixes[1] = %+v, want the hop prefix to succeed", got)
+	}
+}
+
+// TestTraceAttributionSkipsDirectBaseline pins that a connect failure is
+// attributed to the first failing hop, not to the direct baseline.
+func TestTraceAttributionSkipsDirectBaseline(t *testing.T) {
+	// Make the target unreachable directly as well as through the proxy.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	deadAddr := ln.Addr().String()
+	ln.Close()
+
+	denyingProxy := testutil.NewHTTPProxy(t, deadAddr)
+
+	e, err := egress.Build(&config.EgressProfile{
+		Name:  "via-proxy",
+		Chain: []string{"http://" + denyingProxy},
+	})
+	if err != nil {
+		t.Fatalf("build egress: %v", err)
+	}
+
+	rep, err := Run(context.Background(), e, Input{
+		Target:  deadAddr,
+		Mode:    "tcp",
+		Prefix:  true,
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.OK {
+		t.Fatal("OK = true, want false")
+	}
+	if rep.Attribution == nil {
+		t.Fatal("Attribution = nil, want the failing hop prefix")
+	}
+	if !samePath(rep.Attribution.Path, []string{"hop-0"}) {
+		t.Errorf("Attribution.Path = %v, want [hop-0]; direct is context, not a hop", rep.Attribution.Path)
+	}
+}
+
+// TestTraceClosesPrefixEgresses pins that every temporary per-prefix egress is
+// released instead of leaving a parsed chain behind.
+func TestTraceClosesPrefixEgresses(t *testing.T) {
+	target, _ := startTarget(t)
+	proxyAddr := testutil.NewHTTPProxy(t)
+
+	old := buildEgress
+	var built []*egress.Egress
+	buildEgress = func(p *config.EgressProfile) (*egress.Egress, error) {
+		e, err := egress.Build(p)
+		if err == nil {
+			built = append(built, e)
+		}
+		return e, err
+	}
+	t.Cleanup(func() { buildEgress = old })
+
+	rep, err := Run(context.Background(), chainEgress(t, proxyAddr), Input{
+		Target:  target,
+		Mode:    "tcp",
+		Prefix:  true,
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(built) < 2 {
+		t.Fatalf("built %d temporary egresses, want at least direct and one hop", len(built))
+	}
+	for i, e := range built {
+		if !e.Closed() {
+			t.Errorf("temporary egress %d (%s) was not closed", i, e.Name)
+		}
+	}
+	_ = rep
+}
+
+func TestBaselineTimeout(t *testing.T) {
+	// No deadline: the 2s cap.
+	if got := baselineTimeout(context.Background()); got != 2*time.Second {
+		t.Errorf("baselineTimeout(no deadline) = %v, want 2s", got)
+	}
+	// 4s left: 20% is 800ms.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if got := baselineTimeout(ctx); got < 700*time.Millisecond || got > 900*time.Millisecond {
+		t.Errorf("baselineTimeout(4s) = %v, want about 800ms", got)
+	}
+	// 20s left: capped at 2s.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	if got := baselineTimeout(ctx2); got != 2*time.Second {
+		t.Errorf("baselineTimeout(20s) = %v, want 2s", got)
+	}
+}
+
+// TestDNSDefaultResolverRejectsLocalAddress pins that mode=dns cannot silently
+// query a resolver that only exists on this host.
+func TestDNSDefaultResolverRejectsLocalAddress(t *testing.T) {
+	for _, ns := range []string{"127.0.0.53", "10.0.0.53", "192.168.1.1", "fe80::1", "fd00::53"} {
+		t.Run(ns, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "resolv.conf")
+			if err := os.WriteFile(path, []byte("nameserver "+ns+"\n"), 0o600); err != nil {
+				t.Fatalf("write resolv.conf: %v", err)
+			}
+			old := resolvConfPath
+			resolvConfPath = path
+			t.Cleanup(func() { resolvConfPath = old })
+
+			_, err := parseTarget("dns://example.invalid", "dns", "")
+			if err == nil {
+				t.Fatalf("parseTarget accepted default resolver %s, want a rejection", ns)
+			}
+			if !strings.Contains(err.Error(), "resolver") {
+				t.Errorf("error = %v, want it to tell the caller to pass resolver", err)
+			}
+		})
+	}
+}
+
+// TestDNSExplicitResolverWorks proves the rejection does not disable a caller
+// that names the resolver, including one that happens to be local in tests.
+func TestDNSExplicitResolverWorks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(path, []byte("nameserver 127.0.0.53\n"), 0o600); err != nil {
+		t.Fatalf("write resolv.conf: %v", err)
+	}
+	old := resolvConfPath
+	resolvConfPath = path
+	t.Cleanup(func() { resolvConfPath = old })
+
+	p, err := parseTarget("dns://example.invalid", "dns", "1.1.1.1")
+	if err != nil {
+		t.Fatalf("parseTarget with explicit resolver: %v", err)
+	}
+	if p.resolver != "1.1.1.1:53" {
+		t.Errorf("resolver = %q, want 1.1.1.1:53", p.resolver)
+	}
+}
 func startDNSServer(t *testing.T) string {
 	t.Helper()
 

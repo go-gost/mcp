@@ -172,10 +172,15 @@ func Do(ctx context.Context, e *egress.Egress, in Input) (Output, error) {
 			route, err := e.Route(ctx, network, addr)
 			if err != nil {
 				rec.dialDone(time.Since(start))
+				rec.failedOperation(failure.StageConnect, err)
 				return nil, err
 			}
-			conn, err := route.Dial(ctx, network, addr)
+			conn, err := egress.Dial(ctx, route, network, addr)
 			rec.dialDone(time.Since(start))
+			// Record the operation: a proxy 502 or a reset arrives as an
+			// unclassified error, and the caller still needs to know that the
+			// egress dial was what failed.
+			rec.failedOperation(failure.StageConnect, err)
 			return conn, err
 		},
 		// One request per connection: a tool call must not inherit a stale
@@ -453,7 +458,12 @@ func (r *recorder) classify(err error) *failure.Failure {
 			f.Retryable = false
 		}
 	case failure.StageConnect:
-		f.Stage = failure.StageConnect
+		// The dial failed while the classifier had nothing better than
+		// "internal": a proxy 502 or reset. Never rewrite a precise stage
+		// such as proxy_auth or tls_verify or the no_route code.
+		if f.Stage == failure.StageInternal {
+			f.Stage = failure.StageConnect
+		}
 	}
 	return f
 }

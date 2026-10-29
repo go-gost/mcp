@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -148,7 +149,7 @@ func exchangeDNS(ctx context.Context, route chain.Route, resolver string, query 
 		network = "tcp"
 	}
 
-	conn, err := dialRoute(ctx, route, network, resolver)
+	conn, err := egress.Dial(ctx, route, network, resolver)
 	if err != nil {
 		return nil, false, err
 	}
@@ -257,10 +258,13 @@ func resolverAddress(resolver string) (string, error) {
 	return withPort(resolver, dnsDefaultPort)
 }
 
+// resolvConfPath is a variable so tests can stub the system resolver file.
+var resolvConfPath = "/etc/resolv.conf"
+
 func defaultResolver() (string, error) {
-	f, err := os.Open("/etc/resolv.conf")
+	f, err := os.Open(resolvConfPath)
 	if err != nil {
-		return "", fmt.Errorf("trace: read /etc/resolv.conf: %w", err)
+		return "", fmt.Errorf("trace: read %s: %w", resolvConfPath, err)
 	}
 	defer f.Close()
 
@@ -272,11 +276,30 @@ func defaultResolver() (string, error) {
 		}
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && strings.EqualFold(fields[0], "nameserver") {
+			if err := checkDefaultResolver(fields[1]); err != nil {
+				return "", err
+			}
 			return withPort(fields[1], dnsDefaultPort)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return "", err
 	}
-	return "", errors.New("trace: /etc/resolv.conf has no nameserver")
+	return "", fmt.Errorf("trace: %s has no nameserver", resolvConfPath)
+}
+
+// checkDefaultResolver rejects a system resolver that only this host can use.
+//
+// mode=dns asks "what does the exit see for this name". A loopback, private,
+// or link-local nameserver from /etc/resolv.conf is meaningless through an
+// egress, so the caller must name the resolver the exit should query.
+func checkDefaultResolver(addr string) error {
+	ip, err := netip.ParseAddr(strings.Trim(addr, "[]"))
+	if err != nil {
+		return nil
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return fmt.Errorf("trace: default resolver %s is loopback/private/link-local and is not reachable through an egress; pass resolver explicitly", ip)
+	}
+	return nil
 }

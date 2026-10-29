@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-gost/mcp/internal/failure"
 	"github.com/go-gost/mcp/internal/wisp"
@@ -21,6 +22,10 @@ const (
 	// time.Duration can overflow. config validation already caps
 	// gost_wisp.max_ttl at 24h, so this never shortens a configured lease.
 	maxWispTTL = 24 * time.Hour
+
+	// maxWispLabel caps the free-text label so a model cannot grow the lease
+	// store or operator log lines without bound.
+	maxWispLabel = 128
 )
 
 // wispInput is the gost_wisp tool schema. Local is required; ttl_s and verify
@@ -118,7 +123,7 @@ func (s *server) handleWisp(ctx context.Context, _ *mcp.CallToolRequest, in wisp
 
 	lease, err := s.deps.Wisp.Provision(ctx, wisp.Request{
 		Local:  local,
-		Label:  strings.TrimSpace(in.Label),
+		Label:  capLabel(in.Label),
 		TTL:    ttl,
 		Verify: verify,
 	})
@@ -163,9 +168,10 @@ func (s *server) handleUnwisp(ctx context.Context, _ *mcp.CallToolRequest, in un
 	}
 
 	lease, released := s.deps.Wisp.Release(ctx, handle)
-	// An expired lease is already gone: the provisioner retains the record for
-	// reporting and reports the handle as found, but nothing is left to revoke.
-	released = released && lease.State != wisp.StateExpired
+	// An expired or dead lease is already gone: the provisioner retains the
+	// record for reporting and reports the handle as found, but nothing is
+	// left to revoke.
+	released = released && lease.State != wisp.StateExpired && lease.State != wisp.StateDead
 
 	s.logger().Info("wisp: released lease",
 		"handle", handle,
@@ -191,4 +197,18 @@ func wispTTL(seconds int64) (time.Duration, error) {
 	default:
 		return time.Duration(seconds) * time.Second, nil
 	}
+}
+
+// capLabel trims the label and truncates it to maxWispLabel bytes without
+// splitting a UTF-8 sequence.
+func capLabel(label string) string {
+	label = strings.TrimSpace(label)
+	if len(label) <= maxWispLabel {
+		return label
+	}
+	cut := maxWispLabel
+	for cut > 0 && !utf8.RuneStart(label[cut]) {
+		cut--
+	}
+	return label[:cut]
 }

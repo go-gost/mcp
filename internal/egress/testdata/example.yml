@@ -1,0 +1,18 @@
+# The explicit-hops form from README.md and gost-mcp.example.yml.
+# A node's protocol lives in connector.type; addr is always host:port.
+egress:
+  - name: direct
+    description: "Host direct, no proxy"
+    chain: []
+
+  - name: corp
+    description: "Corp exit: HTTP proxy, then internal SOCKS5"
+    hops:
+      - name: hop-0
+        selector: { strategy: round }
+        nodes:
+          - { name: a, addr: "10.0.0.1:8080", connector: { type: http } }
+          - { name: b, addr: "10.0.0.2:8080", connector: { type: http } }
+      - name: hop-1
+        nodes:
+          - { name: c, addr: "10.0.1.5:1080", connector: { type: socks5 } }

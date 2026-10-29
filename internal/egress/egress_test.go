@@ -357,3 +357,98 @@ func TestRegistryProfilesPreserveOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildRejectsConnectorFallbacks pins that a configured profile can never
+// silently become a direct dial or a different protocol: gost's command parser
+// maps an unregistered scheme to the HTTP connector, and a direct/virtual
+// connector skips the hop entirely.
+func TestBuildRejectsConnectorFallbacks(t *testing.T) {
+	explicit := func(node *xconfig.NodeConfig) *config.EgressProfile {
+		return &config.EgressProfile{
+			Name:        "bad",
+			Description: "explicit hop",
+			Hops: []*xconfig.HopConfig{{
+				Name:  "hop-0",
+				Nodes: []*xconfig.NodeConfig{node},
+			}},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		profile *config.EgressProfile
+	}{
+		{"direct scheme", &config.EgressProfile{Name: "bad", Description: "x", Chain: []string{"direct://127.0.0.1:1080"}}},
+		{"virtual scheme", &config.EgressProfile{Name: "bad", Description: "x", Chain: []string{"virtual://127.0.0.1:1080"}}},
+		{"unknown grpc scheme", &config.EgressProfile{Name: "bad", Description: "x", Chain: []string{"grpc://127.0.0.1:1080"}}},
+		{"socks5h alias", &config.EgressProfile{Name: "bad", Description: "x", Chain: []string{"socks5h://127.0.0.1:1080"}}},
+		{"explicit direct connector", explicit(&xconfig.NodeConfig{
+			Name: "a", Addr: "127.0.0.1:1080",
+			Connector: &xconfig.ConnectorConfig{Type: "direct"},
+		})},
+		{"explicit virtual connector", explicit(&xconfig.NodeConfig{
+			Name: "a", Addr: "127.0.0.1:1080",
+			Connector: &xconfig.ConnectorConfig{Type: "virtual"},
+		})},
+		{"explicit addr with scheme", explicit(&xconfig.NodeConfig{
+			Name: "a", Addr: "socks5://127.0.0.1:1080",
+			Connector: &xconfig.ConnectorConfig{Type: "socks5"},
+		})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Build(tt.profile); err == nil {
+				t.Fatalf("Build succeeded for %s, want a rejection", tt.name)
+			}
+		})
+	}
+}
+
+// TestBuildAcceptsCorrectedHopsExample builds the documented explicit-hops
+// example: addr is host:port and the protocol lives in connector.type.
+func TestBuildAcceptsCorrectedHopsExample(t *testing.T) {
+	cfg, err := config.Load("testdata/example.yml")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	reg, err := BuildAll(cfg.Egress)
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	defer reg.Close()
+
+	if _, ok := reg.Get("corp"); !ok {
+		t.Fatalf("corp profile missing from %+v", reg.Profiles())
+	}
+}
+
+// TestCloseIsIdempotent covers the resources a built chain owns.
+func TestCloseIsIdempotent(t *testing.T) {
+	e, err := Build(&config.EgressProfile{Name: "jp", Description: "proxy", Chain: []string{"http://127.0.0.1:8080"}})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if e.Closed() {
+		t.Fatal("Closed = true before Close")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if !e.Closed() {
+		t.Error("Closed = false after Close")
+	}
+	if err := e.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	reg, err := BuildAll([]config.EgressProfile{*directProfile()})
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatalf("registry Close: %v", err)
+	}
+	if err := reg.Close(); err != nil {
+		t.Fatalf("second registry Close: %v", err)
+	}
+}
