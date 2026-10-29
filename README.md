@@ -1,0 +1,413 @@
+# gost-mcp
+
+`gost-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that gives an agent three network primitives: two through egress profiles you configure, and one through a wisp relay.
+
+1. **One HTTP(S) request through a chosen egress** — `gost_run`.
+2. **A staged connectivity diagnosis through a chosen egress** — `gost_trace`.
+3. **A temporary public URL for a loopback HTTP service** — `gost_wisp` / `gost_unwisp`.
+
+It is a single binary that speaks MCP over stdio. It needs no running gost instance, no sidecar, no database, and no network listener of its own.
+
+## What it is
+
+- **Explicit egress.** Every call names an egress profile from a local file. An omitted or unknown profile is an error; there is no silent fallback to a direct connection.
+- **One-shot.** Each call is self-contained and returns a complete result or a classified failure such as `stage=connect, code=timeout`. Nothing is inferred from previous calls. The only state that outlives a call is a wisp lease, addressed by an explicit handle.
+- **Local.** Egress profiles are read once at startup from `gost-mcp.yml`. There is no remote profile distribution and no hot reload.
+- **Small surface.** Four tools and two resources. The model sees profile names and descriptions, never node addresses unless you opt in with `--expose-topology`.
+
+## What it is not
+
+- **Not a gost control plane.** It does not read, write, reload, or observe a gost service's configuration, logs, metrics, or traffic records. It does not talk to gost's API.
+- **Not a proxy server.** It does not listen for SOCKS or HTTP clients and cannot be used to proxy another process. In v0 it has no network listener at all; MCP runs over stdio.
+- **Not a sandbox.** Tool calls run with your user's network identity. See [Security](#security).
+- **Not a tunnel manager for arbitrary services.** `gost_wisp` publishes HTTP services on loopback only by default. It does not expose TCP/UDP, and a lease dies with the process.
+- **Not a traceroute.** `gost_trace` reports cumulative chain prefixes (`direct`, `hop 0`, `hop 0+1`, ...). Per-hop timing inside a hop group is not observable.
+
+## Requirements
+
+- Go 1.26.3 or newer to build from source; the Docker image uses Go 1.27.
+- Any MCP client that supports local (stdio) servers: Claude Code, OpenCode, Codex, or another MCP host.
+
+## Install
+
+From source:
+
+```sh
+git clone https://github.com/go-gost/mcp
+cd mcp
+make build
+install -m 0755 gost-mcp /usr/local/bin/gost-mcp
+gost-mcp --version
+```
+
+With Docker (the image reads `/etc/gost-mcp/gost-mcp.yml` by default):
+
+```sh
+docker build -t gost-mcp .
+
+docker run --rm -i \
+  -v "$PWD/gost-mcp.yml:/etc/gost-mcp/gost-mcp.yml:ro" \
+  -e JP_USER -e JP_PASS \
+  gost-mcp
+```
+
+`-i` is required: MCP uses stdin/stdout. Do not pass `-t`; a TTY corrupts the protocol stream. The image ships `gost-mcp.example.yml` as `/etc/gost-mcp/gost-mcp.yml` (a `direct` profile only), so mount your own file over it for real egress profiles.
+
+## Tools
+
+| Tool | What it does | Annotations |
+|------|--------------|-------------|
+| `gost_run` | Sends one HTTP(S) request through an egress profile. | open-world, non-destructive |
+| `gost_trace` | Diagnoses DNS/TCP/TLS/HTTP/UDP reachability through an egress profile. | read-only, open-world |
+| `gost_wisp` | Publishes a loopback HTTP service at a public wisp URL for a bounded lease. | open-world, non-destructive |
+| `gost_unwisp` | Releases a lease early. Idempotent. | idempotent, non-destructive |
+
+`gost_run` and `gost_trace` require `egress` and treat it as a **profile name**, never a URI. A non-2xx HTTP status from `gost_run` is a successful call. Transport failures come back as `ok=false` with a `failure` object; they are not MCP protocol errors.
+
+### `gost_run`
+
+```json
+{
+  "tool": "gost_run",
+  "arguments": {
+    "egress": "jp",
+    "url": "https://ifconfig.co/json",
+    "timeout_ms": 15000
+  }
+}
+```
+
+Abridged output:
+
+```json
+{
+  "ok": true,
+  "status": 200,
+  "status_text": "OK",
+  "final_url": "https://ifconfig.co/json",
+  "redirects": [],
+  "headers": {"content-type": "application/json"},
+  "body": "{\"ip\":\"203.0.113.7\", ...}",
+  "body_encoding": "utf8",
+  "bytes": 118,
+  "truncated": false,
+  "sha256": "…",
+  "timings": {"connect_ms": 214, "tls_ms": 96, "ttfb_ms": 341, "total_ms": 402},
+  "egress": {"name": "jp"},
+  "failure": null
+}
+```
+
+Arguments: `egress` and `url` are required. Optional: `method` (default `GET`), `headers` (literal values only), `body`, `body_encoding` (`utf8` or `base64`), `timeout_ms` (default 30000, max 120000), `max_bytes` (default 1 MiB, max 8 MiB), `follow_redirects` (default true, max 5).
+
+Notes:
+
+- Response bodies are read up to `max_bytes + 1` so truncation is reported.
+- Text-like content is returned as UTF-8; anything else as base64.
+- Only an allowlist of response headers is echoed to keep output small: `content-type`, `content-length`, `server`, `location`, `content-encoding`, `retry-after`, and a capped set of `x-*`.
+- There is no separate DNS timing: through SOCKS5 or HTTP CONNECT the exit resolves the name, so `connect_ms` covers it. A local lookup would be a second, hidden egress.
+
+### `gost_trace`
+
+```json
+{
+  "tool": "gost_trace",
+  "arguments": {
+    "egress": "corp",
+    "target": "example.com:443"
+  }
+}
+```
+
+Abridged output:
+
+```json
+{
+  "ok": false,
+  "target": "example.com:443",
+  "mode": "tcp",
+  "egress": {"name": "corp"},
+  "stages": [
+    {"name": "resolve", "ok": true, "ms": 2, "detail": {"addrs": ["203.0.113.10"]}},
+    {"name": "connect", "ok": false, "ms": 3100, "error": {"stage": "connect", "code": "timeout", "message": "dial tcp 10.0.0.2:8080: i/o timeout", "retryable": true}}
+  ],
+  "attribution": {"path": ["hop-0", "hop-1"], "stage": "connect", "code": "timeout"},
+  "prefixes": [
+    {"path": ["direct"], "ok": true, "ms": 35, "served_by": []},
+    {"path": ["hop-0"], "ok": true, "ms": 120, "served_by": ["a"]},
+    {"path": ["hop-0", "hop-1"], "ok": false, "ms": 3100, "served_by": ["b"], "stage": "connect", "code": "timeout"}
+  ],
+  "identity": {},
+  "failure": {"stage": "connect", "code": "timeout", "message": "dial tcp 10.0.0.2:8080: i/o timeout", "retryable": true}
+}
+```
+
+Arguments: `egress` and `target` are required. `target` may be `host:port`, an `http(s)://` URL, `udp://host:port`, `tls://host:port`, or `dns://name`. Optional: `mode` (`auto`, `tcp`, `udp`, `dns`, `tls`, `http`), `resolver` (for `mode=dns`), `prefix` (default true), `timeout_ms` (default 10000, max 60000), `payload` (base64), `expect` (substring), `identity` (default false).
+
+Notes:
+
+- `mode=auto` infers `http` for `http(s)://` URLs, `tcp` for a bare `host:port`, `udp` for `udp://`, `dns` for `dns://`, and `tls` for `tls://`. A bare `example.com:443` is a TCP trace, not a TLS handshake.
+- The `resolve` stage is local and informational. With SOCKS5/HTTP CONNECT the exit resolves the name, so a local DNS failure does not prove the chain fails.
+- `mode=dns` sends an explicit query **through the egress** to `resolver` (default: the first nameserver in `/etc/resolv.conf`).
+- Prefix probing connects only and stops at the first failure. The full chain then runs the complete stage test. With a multi-node hop, the probe and the final attempt may use different nodes, so attribution is best-effort and each prefix reports `served_by` (node names, never addresses).
+- `timeout_ms` is a budget for the whole call. A timeout returns the prefixes that completed plus `ok=false`.
+- An empty route is `code=no_route`, never a direct dial.
+- `identity` makes one extra HTTPS request through the full chain to `gost_trace.identity_url` and reports `{ip, family, country, asn, org}` when the endpoint provides them.
+
+### `gost_wisp`
+
+```json
+{
+  "tool": "gost_wisp",
+  "arguments": {
+    "local": "127.0.0.1:3000",
+    "ttl_s": 600,
+    "label": "preview",
+    "verify": true
+  }
+}
+```
+
+```json
+{
+  "ok": true,
+  "url": "https://134c714b65d54a4f.gost.run",
+  "handle": "w_7f3c2a1b9d40",
+  "local": "127.0.0.1:3000",
+  "expires_at": "2026-10-29T12:15:00Z",
+  "state": "active",
+  "verify": {"checked": true, "status": 200}
+}
+```
+
+Arguments: `local` is required and must be a literal `host:port` that resolves entirely inside `gost_wisp.allow`. Optional: `ttl_s` (default 900, capped by `gost_wisp.max_ttl`), `label` (free text for logs; never part of the URL), `verify` (default true, one GET through the public URL).
+
+Notes:
+
+- The URL is `https://<relay-label>.<gost_wisp.domain>`. The relay is configuration, never a tool argument.
+- The relay may re-bind a tunnel and issue a new label. Read `gost-mcp://leases` for the current URL instead of reusing a stale one. States are `active`, `rebound`, and `expired`.
+- `verify` only proves the tunnel at creation time; any HTTP status, including 401 or 404, means the tunnel works.
+- Leases are in memory. Process exit closes them all.
+
+### `gost_unwisp`
+
+```json
+{"tool": "gost_unwisp", "arguments": {"handle": "w_7f3c2a1b9d40"}}
+```
+
+```json
+{"ok": true, "released": true, "url": "https://134c714b65d54a4f.gost.run"}
+```
+
+An unknown, expired, or already released handle returns `released=false` rather than an error.
+
+### Resources
+
+- `gost-mcp://egress` — configured profiles as `{name, description}`. Node addresses appear only with `--expose-topology`, and credentials are stripped.
+- `gost-mcp://leases` — leases as `{handle, url, local, label, state, expires_at}`, including expired records retained for reporting. Read this after a re-bind.
+
+## Configuration
+
+`gost-mcp` looks for its file in this order:
+
+1. `--config PATH`
+2. `./gost-mcp.yml`
+3. `~/.gost-mcp/gost-mcp.yml`
+4. `/etc/gost-mcp/gost-mcp.yml`
+
+The file is read once. Changing a profile requires a restart.
+
+A complete example:
+
+```yaml
+# Egress profiles. The schema is gost's chain/hop schema; `chain:` is the -F sugar.
+egress:
+  - name: direct
+    description: "Host direct, no proxy"
+    chain: []
+
+  - name: jp
+    description: "Tokyo residential exit (SOCKS5)"
+    chain:
+      - "socks5://${JP_USER}:${JP_PASS}@tokyo.example.com:1080"
+
+  - name: corp
+    description: "Corp exit: HTTP proxy, then internal SOCKS5"
+    hops:
+      - name: hop-0
+        selector: { strategy: round }
+        nodes:
+          - { name: a, addr: "http://10.0.0.1:8080" }
+          - { name: b, addr: "http://10.0.0.2:8080" }
+      - name: hop-1
+        nodes:
+          - { name: c, addr: "socks5://10.0.1.5:1080" }
+
+  - name: wifi
+    description: "Force wlan0, to compare with the cellular exit"
+    chain:
+      - "socks5://192.168.1.10:1080?interface=wlan0"
+
+gost_run:
+  timeout: 30s
+  max_bytes: 1MiB
+
+gost_trace:
+  timeout: 10s
+  identity_url: "https://ifconfig.co/json"
+
+gost_wisp:
+  relay: "tunnel+wss://wisper.gost.run:443"
+  domain: "gost.run"
+  max_ttl: 1h
+  max_leases: 4
+  # Loopback only by default. Widening is configuration-only, never a tool argument.
+  allow: ["127.0.0.0/8", "::1/128"]
+
+log:
+  level: info          # logs go to stderr; stdout is the MCP channel
+```
+
+`gost-mcp.example.yml` in this repository is the same shape with commented credentials; the Docker image installs it as `/etc/gost-mcp/gost-mcp.yml`.
+
+### Profile rules
+
+- A profile needs a unique `name` matching `[a-z0-9_-]{1,32}` and a non-blank `description`.
+- Set exactly one of `chain` or `hops`.
+  - `chain` is a list of gost `-F` URIs; **each entry is one hop**.
+  - `hops` is the full hop schema, for a pool of nodes in one hop.
+  - `chain: []` is the explicit direct profile. There is no implicit direct egress.
+- Hop- and node-level `bypass`, `bypasses`, `matcher`, and `filter` are rejected. They can make gost skip a hop and eventually dial direct, which would turn a configured egress into a hidden bypass. Use a separate `direct` profile.
+- Dynamic node sources (`file`, `redis`, `http`, `plugin`), `reload`, and named `resolver`/`hosts` components are rejected. Nodes must be static for the process lifetime.
+- File-level `services`, `authers`, `resolvers`, `hosts`, `plugins`, and `sd` are rejected rather than silently ignored.
+- Chain query parameters `bypass`, `bypasses`, `matcher`, `filter`, `resolver`, `hosts`, and `sd` are rejected.
+
+### Settings and defaults
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `gost_run.timeout` | `30s` | Per-call default; the tool can pass `timeout_ms` up to 120000. |
+| `gost_run.max_bytes` | `1MiB` | Per-call default; the tool can pass `max_bytes` up to 8 MiB. |
+| `gost_trace.timeout` | `10s` | Budget for the whole trace; the tool can pass up to 60000 ms. |
+| `gost_trace.identity_url` | `https://ifconfig.co/json` | Used only when a call sets `identity: true`. |
+| `gost_wisp.relay` | `tunnel+wss://wisper.gost.run:443` | Configuration-only; not a tool argument. |
+| `gost_wisp.domain` | `gost.run` | Public suffix used to build the URL. |
+| `gost_wisp.max_ttl` | `1h` | Range `1s..24h`; a larger `ttl_s` is clamped. |
+| `gost_wisp.max_leases` | `4` | Range `1..64`; concurrent live leases. |
+| `gost_wisp.allow` | `127.0.0.0/8`, `::1/128` | IPs or CIDR prefixes. A target must resolve entirely inside the list. |
+| `log.level` | `info` | Accepted and validated (`debug`, `info`, `warn`, `error`); reserved for log wiring. |
+| `log.file` | empty | Reserved; logs always go to stderr, because stdout is reserved for MCP frames. |
+
+Durations accept Go syntax (`30s`, `1h`) or a bare number of seconds. Sizes accept a byte count or `1MiB`-style strings.
+
+## `${ENV}` expansion
+
+`${NAME}` references are expanded in **every string value** before YAML parsing. Only the braced form is expanded, so a bare `$` in a password survives.
+
+- An unset variable is a **startup error**, never an empty string. A missing credential cannot silently become an anonymous connection.
+- Expansion happens before YAML parsing, so a `${NAME}` in a **comment** is expanded too and an unset one still fails. Avoid `${...}` in comments, or define the variable.
+- Put credentials in the MCP client's `environment`/`env` block and reference them here. Do not commit them to the YAML.
+
+## Validate the configuration
+
+```sh
+gost-mcp --config /etc/gost-mcp/gost-mcp.yml --check
+```
+
+```
+direct  Host direct, no proxy            0 hops  0 nodes
+jp      Tokyo residential exit (SOCKS5)  1 hop   1 node
+```
+
+`--check` parses, expands, and validates every profile, then prints name, description, hop count, and node count — never addresses or credentials. It exits `0` when the file is valid and `1` when it is not. It also warns when the file is group- or world-readable, because it may contain credentials:
+
+```
+gost-mcp: warning: /etc/gost-mcp/gost-mcp.yml is accessible by group or others (0644); it may contain credentials, use 0600
+```
+
+`--skip-invalid` drops profiles that fail validation (with a warning) instead of failing startup. File-level errors are never skipped.
+
+Other flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--config PATH` | Configuration file. |
+| `--check` | Validate, print profiles, exit. |
+| `--skip-invalid` | Skip bad profiles at startup. |
+| `--expose-topology` | Include node addresses in `gost-mcp://egress`. |
+| `--version` | Print the version and exit. |
+
+## MCP client configuration
+
+A server entry needs a command, the config path, and the environment variables that `${...}` references need:
+
+```json
+{
+  "command": "/usr/local/bin/gost-mcp",
+  "args": ["--config", "/etc/gost-mcp/gost-mcp.yml"],
+  "env": {
+    "JP_USER": "alice",
+    "JP_PASS": "s3cret"
+  }
+}
+```
+
+Per-host examples, with the exact snippet and worked prompts:
+
+- [Claude Code](examples/claude-code.md)
+- [OpenCode](examples/opencode.md)
+- [Codex](examples/codex.md)
+
+Keep the config file out of version control (`.gitignore` already ignores `gost-mcp.yml` and `.gost-mcp/`).
+
+## Security
+
+Read this before pointing the server at anything real.
+
+- **The server runs with your network identity, not in a sandbox.** A tool call can reach whatever the process can reach through the configured proxies. The egress file bounds *how* traffic leaves and which profiles exist; it is not a security boundary against a malicious model or prompt injection. Run it as a dedicated unprivileged user if that matters.
+- **A published URL is public and unauthenticated.** Anyone who learns a `gost_wisp` URL can reach the local service until the lease is released or expires. The local service must authenticate its own users. Do not publish an admin UI or an unauthenticated internal API.
+- **Publishing is loopback-only by default.** `gost_wisp.allow` defaults to `127.0.0.0/8` and `::1/128`. Widening it is a configuration decision; there is no tool argument for it. The relay address is also configuration-only, so a model cannot point a tunnel at an arbitrary relay.
+- **There is no `env:` header indirection.** `gost_run.headers` values are literal. A secret placed in a header is visible to the model and in the request. This is deliberate: header-to-server-secret indirection would let a prompt-injected model exfiltrate a credential to an arbitrary host.
+- **Credentials belong in the MCP client's environment, not the YAML.** Reference them as `${JP_PASS}`. If the file does contain credentials, `chmod 0600` it; `--check` and startup warn when it is group- or world-readable.
+- **No hidden direct egress.** `egress` is required, an unknown name is an error, and profiles cannot use `bypass`/`matcher`/`filter` to skip a hop.
+- **No network listener in v0.** MCP uses stdio, so there is no port to authenticate. stdout carries protocol frames; all logs and warnings go to stderr.
+- **Leases are logged and bounded.** Publications and releases are logged to stderr with label, target, URL, handle, and expiry — never credentials or node addresses. TTL, lease count, and target allow-list are enforced.
+
+## Build and test
+
+```sh
+make build     # ./gost-mcp with the version from git describe
+make test      # go test ./...
+make race      # CGO_ENABLED=1 go test -race ./...
+make check     # build, then validate internal/config/testdata/egress.yml
+make lint      # gofmt check and go vet
+```
+
+Without `make`:
+
+```sh
+CGO_ENABLED=0 go build -trimpath -o gost-mcp ./cmd/gost-mcp
+go test ./...
+CGO_ENABLED=1 go test -race ./...
+./gost-mcp --version
+./gost-mcp --config internal/config/testdata/egress.yml --check
+```
+
+The version comes from `-ldflags "-X main.version=v0.1.0"`; a plain `go build` reports `dev`. Release builds are produced by [goreleaser](https://goreleaser.com) from `.goreleaser.yaml` (linux/darwin/windows, amd64/arm64, `CGO_ENABLED=0`, no UPX). The Docker image is built from the `Dockerfile`.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `config: no configuration file found` | No `--config` and no file in the default search paths. |
+| `config: undefined environment variable(s): X` | The MCP client did not pass `X` in its `env` block. |
+| `unknown egress "x"; available profiles: ...` | The profile is missing or the server was not restarted after editing. |
+| `ok=false`, `stage=connect`, `code=no_route` | A hop selected no node; the chain was rejected instead of dialing direct. |
+| `ok=false`, `stage=proxy_auth`, `code=proxy_auth_failed` | Wrong proxy credentials; check `${...}` expansion. |
+| `gost_wisp: target not allowed` | The target resolved outside `gost_wisp.allow`. |
+| `gost_wisp: max leases reached` | Release a lease with `gost_unwisp` or raise `max_leases`. |
+| A published URL stops working | The lease expired, the process restarted, or the relay re-bound it; read `gost-mcp://leases`. |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,12 @@
+# Build artifacts
+/.git
+/dist
+/gost-mcp
+
+# Local configuration, which may contain credentials
+/gost-mcp.yml
+/.gost-mcp
+
+# Test artifacts
+*.test
+/coverage.out

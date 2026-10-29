@@ -1,0 +1,60 @@
+# Starter configuration for gost-mcp.
+#
+# Copy this file to one of the search paths and edit it:
+#   ./gost-mcp.yml
+#   ~/.gost-mcp/gost-mcp.yml
+#   /etc/gost-mcp/gost-mcp.yml
+#
+# The file is read once at startup. A profile change requires a restart.
+#
+# Credentials: keep them out of this file. Reference the environment that the
+# MCP client passes to the process with a braced variable in an active YAML
+# value; an unset variable is a startup error, never an empty string. If the
+# file does contain credentials, chmod 0600 it.
+#
+# Note: environment expansion runs before YAML parsing, so an undefined
+# variable reference fails even when it appears in a comment. Do not write
+# variable references in comments.
+
+egress:
+  - name: direct
+    description: "Host direct, no proxy"
+    chain: []
+
+  # A chain is a list of gost -F URIs. Each entry is one hop.
+  # - name: jp
+  #   description: "Tokyo residential exit (SOCKS5)"
+  #   chain:
+  #     - "socks5://USER:PASSWORD@tokyo.example.com:1080"
+
+  # Use hops when one hop needs a pool of nodes.
+  # - name: corp
+  #   description: "Corp exit: HTTP proxy, then internal SOCKS5"
+  #   hops:
+  #     - name: hop-0
+  #       selector: { strategy: round }
+  #       nodes:
+  #         - { name: a, addr: "http://10.0.0.1:8080" }
+  #         - { name: b, addr: "http://10.0.0.2:8080" }
+  #     - name: hop-1
+  #       nodes:
+  #         - { name: c, addr: "socks5://10.0.1.5:1080" }
+
+gost_run:
+  timeout: 30s
+  max_bytes: 1MiB
+
+gost_trace:
+  timeout: 10s
+  identity_url: "https://ifconfig.co/json"
+
+gost_wisp:
+  relay: "tunnel+wss://wisper.gost.run:443"
+  domain: "gost.run"
+  max_ttl: 1h
+  max_leases: 4
+  # Loopback only by default. Widening this is a configuration decision.
+  allow: ["127.0.0.0/8", "::1/128"]
+
+log:
+  level: info

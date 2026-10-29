@@ -1,0 +1,60 @@
+version: 2
+
+project_name: gost-mcp
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gost-mcp
+    main: ./cmd/gost-mcp
+    binary: gost-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+# UPX is deliberately absent: gost#863 disabled it because upx --best adds
+# startup time on low-spec systems, which matters more than binary size here.
+
+archives:
+  - id: gost-mcp
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - gost-mcp.example.yml
+      - examples/*.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
