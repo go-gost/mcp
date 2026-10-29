@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,11 +47,21 @@ const (
 	// defaultLeaseTTL mirrors the spec's 900 s default when the caller omits
 	// a TTL. It is still clamped to MaxTTL.
 	defaultLeaseTTL = 15 * time.Minute
+	// maxExpiredRecords caps the expired-lease records kept for reporting.
+	// Each expired record no longer owns a service, but retaining unbounded
+	// records would still grow the store for every short-TTL lease.
+	maxExpiredRecords = 32
 )
 
 // ErrTargetNotAllowed reports a target that did not resolve exclusively to an
 // address inside the configured allow list.
 var ErrTargetNotAllowed = errors.New("wisp: target not allowed")
+
+// ErrInvalidTarget reports a target that is not a literal host:port with a
+// numeric port in 1..65535. Such input is rejected before any resolution or
+// interpolation into a gost URI, where characters such as "?", "#", "/", "@"
+// or whitespace would be interpreted by gost's parser.
+var ErrInvalidTarget = errors.New("wisp: invalid target")
 
 // httpClient performs the optional reachability check. Tests replace it.
 var httpClient = &http.Client{Timeout: verifyTimeout}
@@ -90,16 +101,18 @@ type Provisioner interface {
 	List() []Lease
 }
 
-// ServiceFactory constructs the service that publishes local. Production uses
-// the real gost rtcp service; tests inject a fake.
-type ServiceFactory func(ctx context.Context, local string) (service.Service, error)
-
-// handleKey carries the lease handle into the real factory so its chain is
-// named after the lease. Injected factories ignore it.
-type handleKey struct{}
+// ServiceFactory constructs the service that publishes addr. name is the
+// lease name ("lease-<handle>") and is used for both the service and its
+// chain so concurrent leases never collide in gost's registries. addr is the
+// resolved, allow-list-checked literal address, never the caller's hostname:
+// the remote-forward handler would otherwise re-resolve a hostname per
+// connection for the whole lease lifetime.
+//
+// Production uses the real gost rtcp service; tests inject a fake.
+type ServiceFactory func(ctx context.Context, name, addr string) (service.Service, error)
 
 // lease is the mutable record behind a Lease. Fields are guarded by the
-// provisioner mutex; svc and done are set once at construction.
+// provisioner mutex; done is set once at construction.
 type lease struct {
 	Lease
 
@@ -118,7 +131,8 @@ type provisioner struct {
 
 	mu       sync.Mutex
 	leases   map[string]*lease
-	reserved int // slots held by in-flight Provision calls
+	expired  []*lease // FIFO order of expiry, capped at maxExpiredRecords
+	reserved int      // slots held by in-flight Provision calls
 }
 
 // New returns a provisioner for cfg. A nil factory uses the real gost relay
@@ -154,7 +168,8 @@ func (p *provisioner) Provision(ctx context.Context, req Request) (Lease, error)
 	if err := ctx.Err(); err != nil {
 		return Lease{}, err
 	}
-	if err := p.checkTarget(ctx, req.Local); err != nil {
+	target, err := p.checkTarget(ctx, req.Local)
+	if err != nil {
 		return Lease{}, err
 	}
 
@@ -163,6 +178,7 @@ func (p *provisioner) Provision(ctx context.Context, req Request) (Lease, error)
 	if err != nil {
 		return Lease{}, err
 	}
+	name := "lease-" + handle
 
 	if err := p.reserve(); err != nil {
 		return Lease{}, err
@@ -175,7 +191,7 @@ func (p *provisioner) Provision(ctx context.Context, req Request) (Lease, error)
 		}
 	}
 
-	svc, err := p.factory(context.WithValue(ctx, handleKey{}, handle), req.Local)
+	svc, err := p.factory(ctx, name, target)
 	if err != nil {
 		unreserve()
 		return Lease{}, fmt.Errorf("wisp: build service: %w", err)
@@ -222,21 +238,26 @@ func (p *provisioner) Provision(ctx context.Context, req Request) (Lease, error)
 	}
 
 	// The timer callback blocks on p.mu, so even a zero-length TTL cannot
-	// expire the lease before it is stored.
+	// expire the lease before it is stored. Snapshot while still holding the
+	// mutex so a TTL that fires immediately after the unlock cannot race the
+	// caller's copy.
 	p.mu.Lock()
 	l.timer = time.AfterFunc(ttl, func() { p.expire(l) })
 	p.leases[handle] = l
 	p.reserved--
+	out := l.snapshot()
 	p.mu.Unlock()
 	reserved = false
 
 	go p.watch(l)
 
-	return l.snapshot(), nil
+	return out, nil
 }
 
 // Release stops the service and forgets the lease. A second Release for the
-// same handle reports false; it never closes the service twice.
+// same handle reports false; it never closes the service twice. Once an
+// expired record has been pruned by the maxExpiredRecords cap, Release also
+// reports false: the record and its (already closed) service are gone.
 func (p *provisioner) Release(ctx context.Context, handle string) (Lease, bool) {
 	if handle == "" {
 		return Lease{}, false
@@ -249,21 +270,25 @@ func (p *provisioner) Release(ctx context.Context, handle string) (Lease, bool) 
 		return Lease{}, false
 	}
 	delete(p.leases, handle)
+	p.dropExpiredLocked(l)
 	l.stopLocked()
 	alreadyClosed := l.closed
 	l.closed = true
 	out := l.snapshot()
+	svc := l.svc
+	l.svc = nil
 	p.mu.Unlock()
 
-	if !alreadyClosed {
-		l.svc.Close()
-		releaseReal(l.svc)
+	if !alreadyClosed && svc != nil {
+		svc.Close()
+		releaseReal(svc)
 	}
 	return out, true
 }
 
 // List returns a snapshot of every lease, including expired ones, ordered by
-// expiry. Expired leases remain until they are released.
+// expiry. Expired leases remain until they are released or pruned by the
+// maxExpiredRecords cap.
 func (p *provisioner) List() []Lease {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -281,32 +306,85 @@ func (p *provisioner) List() []Lease {
 	return out
 }
 
-// checkTarget resolves every address of req.Local and accepts it only when all
-// of them are inside the allow list. The check is deliberately all-or-nothing:
-// a host that resolves to one allowed and one denied address is denied.
-func (p *provisioner) checkTarget(ctx context.Context, local string) error {
-	host, _, err := net.SplitHostPort(local)
+// checkTarget validates local, resolves it, and returns a pinned literal
+// host:port. Every resolved address must be inside the allow list; the first
+// address is then chosen as the pinned target. Pinning is deliberate: gost's
+// remote-forward handler re-resolves a hostname for every connection over the
+// whole lease lifetime, so passing the hostname through would allow a name
+// that passed this check to later resolve to a denied or internal address.
+//
+// The check is all-or-nothing: a host that resolves to one allowed and one
+// denied address is denied rather than silently using the allowed one. If a
+// host resolves to several allowed addresses, the first is used.
+func (p *provisioner) checkTarget(ctx context.Context, local string) (string, error) {
+	host, port, err := net.SplitHostPort(local)
 	if err != nil {
-		return fmt.Errorf("wisp: invalid local address %q: %w", local, err)
+		return "", fmt.Errorf("%w: %q: %v", ErrInvalidTarget, local, err)
 	}
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return fmt.Errorf("wisp: invalid local address %q: missing host", local)
+	if !validHost(host) {
+		return "", fmt.Errorf("%w: %q: host must be an IP address or a DNS name", ErrInvalidTarget, local)
+	}
+	if !validPort(port) {
+		return "", fmt.Errorf("%w: %q: port must be an integer in 1..65535", ErrInvalidTarget, local)
 	}
 
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("wisp: resolve %q: %w", host, err)
+		return "", fmt.Errorf("wisp: resolve %q: %w", host, err)
 	}
 	if len(addrs) == 0 {
-		return fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
+		return "", fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
 	}
 	for _, addr := range addrs {
 		if !p.allowed(addr.IP) {
-			return fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
+			return "", fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
 		}
 	}
-	return nil
+
+	picked, ok := netip.AddrFromSlice(addrs[0].IP)
+	if !ok {
+		return "", fmt.Errorf("wisp: %q: %w", local, ErrTargetNotAllowed)
+	}
+	return net.JoinHostPort(picked.Unmap().String(), port), nil
+}
+
+// validHost accepts an IP literal (v4 or v6) or a DNS name made only of
+// [A-Za-z0-9._-]. Rejecting every other byte keeps shell metacharacters,
+// URI delimiters ("?", "#", "/", "@"), and whitespace out of the gost URI
+// that the factory builds.
+func validHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validPort accepts only ASCII digits in 1..65535, so a non-numeric or
+// out-of-range port can never reach gost's address parser.
+func validPort(port string) bool {
+	if port == "" || len(port) > 5 {
+		return false
+	}
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n >= 1 && n <= 65535
 }
 
 func (p *provisioner) allowed(ip net.IP) bool {
@@ -376,7 +454,8 @@ func (p *provisioner) waitForHost(ctx context.Context, svc service.Service, serv
 }
 
 // watch follows the listener address for the life of the lease and updates the
-// public URL when the relay re-binds the tunnel.
+// public URL when the relay re-binds the tunnel. Reading the service and its
+// address under the mutex guarantees expire/release have not cleared svc.
 func (p *provisioner) watch(l *lease) {
 	ticker := time.NewTicker(rebindInterval)
 	defer ticker.Stop()
@@ -386,14 +465,15 @@ func (p *provisioner) watch(l *lease) {
 		case <-l.done:
 			return
 		case <-ticker.C:
-			host := addrHost(l.svc.Addr())
-			if host == "" {
-				continue
-			}
 			p.mu.Lock()
-			if l.stopped {
+			if l.stopped || l.svc == nil {
 				p.mu.Unlock()
 				return
+			}
+			host := addrHost(l.svc.Addr())
+			if host == "" {
+				p.mu.Unlock()
+				continue
 			}
 			if host != l.host {
 				l.host = host
@@ -405,8 +485,9 @@ func (p *provisioner) watch(l *lease) {
 	}
 }
 
-// expire closes an expired lease's tunnel and marks it expired. The record is
-// kept so List can report the expiry; Release removes it.
+// expire closes an expired lease's tunnel, marks it expired, and drops its
+// reference to the service. The record is kept (up to maxExpiredRecords) so
+// List can report the expiry; Release removes it.
 func (p *provisioner) expire(l *lease) {
 	p.mu.Lock()
 	cur, ok := p.leases[l.Handle]
@@ -417,10 +498,43 @@ func (p *provisioner) expire(l *lease) {
 	l.State = StateExpired
 	l.stopLocked()
 	l.closed = true
+	svc := l.svc
+	l.svc = nil
+	p.expired = append(p.expired, l)
+	p.trimExpiredLocked()
 	p.mu.Unlock()
 
-	l.svc.Close()
-	releaseReal(l.svc)
+	if svc != nil {
+		svc.Close()
+		releaseReal(svc)
+	}
+}
+
+// trimExpiredLocked enforces the expired-record cap in FIFO order. Pruned
+// records are removed from the map as well, so List and Release both treat
+// them as gone. The caller holds p.mu.
+func (p *provisioner) trimExpiredLocked() {
+	for len(p.expired) > maxExpiredRecords {
+		old := p.expired[0]
+		p.expired = p.expired[1:]
+		if cur, ok := p.leases[old.Handle]; ok && cur == old {
+			delete(p.leases, old.Handle)
+		}
+	}
+}
+
+// dropExpiredLocked removes l from the expired FIFO when it is released. The
+// caller holds p.mu.
+func (p *provisioner) dropExpiredLocked(l *lease) {
+	if l.State != StateExpired {
+		return
+	}
+	for i, old := range p.expired {
+		if old == l {
+			p.expired = append(p.expired[:i], p.expired[i+1:]...)
+			return
+		}
+	}
 }
 
 // stopLocked stops the timer and watcher. The caller holds p.mu.

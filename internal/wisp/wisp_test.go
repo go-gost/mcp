@@ -65,7 +65,7 @@ func (s *fakeService) Close() error {
 }
 
 func staticFactory(svc service.Service) ServiceFactory {
-	return func(context.Context, string) (service.Service, error) { return svc, nil }
+	return func(context.Context, string, string) (service.Service, error) { return svc, nil }
 }
 
 func testConfig() config.WispConfig {
@@ -127,7 +127,7 @@ func TestProvisionReturnsPublicURL(t *testing.T) {
 
 func TestProvisionRejectsNonLoopback(t *testing.T) {
 	var called atomic.Bool
-	p := New(testConfig(), func(context.Context, string) (service.Service, error) {
+	p := New(testConfig(), func(context.Context, string, string) (service.Service, error) {
 		called.Store(true)
 		return newFakeService(testAddr{host: "abc123"}), nil
 	})
@@ -138,6 +138,203 @@ func TestProvisionRejectsNonLoopback(t *testing.T) {
 	}
 	if called.Load() {
 		t.Error("factory was called for a disallowed target")
+	}
+}
+
+func TestProvisionPinsResolvedTarget(t *testing.T) {
+	type call struct{ name, addr string }
+	calls := make(chan call, 1)
+	p := New(testConfig(), func(_ context.Context, name, addr string) (service.Service, error) {
+		calls <- call{name: name, addr: addr}
+		return newFakeService(testAddr{host: "abc123"}), nil
+	})
+
+	lease, err := p.Provision(context.Background(), Request{Local: "localhost:8080"})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	t.Cleanup(func() { p.Release(context.Background(), lease.Handle) })
+
+	c := <-calls
+	if got, want := c.name, "lease-"+lease.Handle; got != want {
+		t.Errorf("factory name = %q, want %q", got, want)
+	}
+	host, port, err := net.SplitHostPort(c.addr)
+	if err != nil {
+		t.Fatalf("factory addr %q is not host:port: %v", c.addr, err)
+	}
+	if host == "localhost" {
+		t.Fatalf("factory received hostname %q, want the pinned IP literal", host)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		t.Fatalf("factory host %q is not an IP literal", host)
+	}
+	if !ip.IsLoopback() {
+		t.Errorf("factory host %q is not loopback", host)
+	}
+	if port != "8080" {
+		t.Errorf("factory port = %q, want 8080", port)
+	}
+	if got := lease.Local; got != "localhost:8080" {
+		t.Errorf("lease Local = %q, want the caller's original target", got)
+	}
+}
+
+func TestProvisionDeniedByAllowList(t *testing.T) {
+	cfg := testConfig()
+	cfg.Allow = []string{"10.0.0.0/8"}
+
+	var called atomic.Bool
+	p := New(cfg, func(context.Context, string, string) (service.Service, error) {
+		called.Store(true)
+		return newFakeService(testAddr{host: "abc123"}), nil
+	})
+
+	_, err := p.Provision(context.Background(), Request{Local: "127.0.0.1:8080"})
+	if !errors.Is(err, ErrTargetNotAllowed) {
+		t.Fatalf("err = %v, want ErrTargetNotAllowed", err)
+	}
+	if called.Load() {
+		t.Error("factory was called for a target outside a non-default allow list")
+	}
+}
+
+func TestProvisionRejectsMalformedTarget(t *testing.T) {
+	targets := []string{
+		"127.0.0.1:8080?bypass=x",
+		"host:notaport",
+		"host:99999",
+		"host:0",
+		"host:8080/../x",
+		"user@127.0.0.1:8080",
+		" 127.0.0.1:8080",
+		"127.0.0.1",
+	}
+	for _, local := range targets {
+		t.Run(local, func(t *testing.T) {
+			var called atomic.Bool
+			p := New(testConfig(), func(context.Context, string, string) (service.Service, error) {
+				called.Store(true)
+				return newFakeService(testAddr{host: "abc123"}), nil
+			})
+
+			_, err := p.Provision(context.Background(), Request{Local: local})
+			if !errors.Is(err, ErrInvalidTarget) {
+				t.Fatalf("err = %v, want ErrInvalidTarget", err)
+			}
+			if called.Load() {
+				t.Error("factory was called for a malformed target")
+			}
+		})
+	}
+}
+
+// TestProvisionShortTTLIsRaceFree hammers the window between storing a lease
+// and returning its copy: a 1 ns TTL fires immediately, so without taking the
+// snapshot under the mutex `go test -race` reports a data race on State.
+func TestProvisionShortTTLIsRaceFree(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxLeases = 100
+	p := New(cfg, func(context.Context, string, string) (service.Service, error) {
+		return newFakeService(testAddr{host: "abc123"}), nil
+	})
+
+	for i := 0; i < 100; i++ {
+		lease, err := p.Provision(context.Background(), Request{
+			Local: "127.0.0.1:8080",
+			TTL:   time.Nanosecond,
+		})
+		if err != nil {
+			t.Fatalf("Provision %d: %v", i, err)
+		}
+		if lease.Handle == "" {
+			t.Fatalf("Provision %d returned an empty handle", i)
+		}
+		_ = p.List()
+	}
+}
+
+func TestExpiredLeasesAreCapped(t *testing.T) {
+	const n = 40
+	var fakes []*fakeService
+	cfg := testConfig()
+	cfg.MaxLeases = n
+
+	factory := func(context.Context, string, string) (service.Service, error) {
+		svc := newFakeService(testAddr{host: "abc123"})
+		fakes = append(fakes, svc)
+		return svc, nil
+	}
+	p := New(cfg, factory)
+
+	handles := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		lease, err := p.Provision(context.Background(), Request{
+			Local: "127.0.0.1:8080",
+			TTL:   5 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Provision %d: %v", i, err)
+		}
+		handles = append(handles, lease.Handle)
+	}
+
+	ok := waitFor(t, 5*time.Second, func() bool {
+		leases := p.List()
+		if len(leases) != maxExpiredRecords {
+			return false
+		}
+		for _, l := range leases {
+			if l.State != StateExpired {
+				return false
+			}
+		}
+		closed := 0
+		for _, svc := range fakes {
+			closed += int(svc.closes.Load())
+		}
+		return closed == n
+	})
+	if !ok {
+		t.Fatalf("expired leases were not capped at %d, List = %+v", maxExpiredRecords, p.List())
+	}
+
+	pr, ok := p.(*provisioner)
+	if !ok {
+		t.Fatal("New did not return a *provisioner")
+	}
+	pr.mu.Lock()
+	if got := len(pr.leases); got != maxExpiredRecords {
+		t.Errorf("stored leases = %d, want %d", got, maxExpiredRecords)
+	}
+	if got := len(pr.expired); got != maxExpiredRecords {
+		t.Errorf("expired FIFO = %d, want %d", got, maxExpiredRecords)
+	}
+	for _, l := range pr.leases {
+		if l.svc != nil {
+			t.Errorf("retained lease %s still holds a service", l.Handle)
+		}
+	}
+	pr.mu.Unlock()
+
+	// A pruned record is gone; Release cannot find it and must not panic.
+	live := make(map[string]bool, maxExpiredRecords)
+	for _, l := range p.List() {
+		live[l.Handle] = true
+	}
+	pruned := ""
+	for _, h := range handles {
+		if !live[h] {
+			pruned = h
+			break
+		}
+	}
+	if pruned == "" {
+		t.Fatal("no lease was pruned from the expired cap")
+	}
+	if _, ok := p.Release(context.Background(), pruned); ok {
+		t.Error("Release of a pruned lease = true, want false")
 	}
 }
 
@@ -216,7 +413,7 @@ func TestLeaseExpiresAtTTL(t *testing.T) {
 
 func TestMaxLeases(t *testing.T) {
 	var n atomic.Int32
-	factory := func(context.Context, string) (service.Service, error) {
+	factory := func(context.Context, string, string) (service.Service, error) {
 		return newFakeService(testAddr{host: fmt.Sprintf("h%d", n.Add(1))}), nil
 	}
 	cfg := testConfig()
@@ -351,8 +548,7 @@ func TestRealFactoryBuildsService(t *testing.T) {
 		Domain: "gost.run",
 	}
 	factory := realServiceFactory(cfg)
-	ctx := context.WithValue(context.Background(), handleKey{}, "testhandle")
-	svc, err := factory(ctx, "127.0.0.1:8080")
+	svc, err := factory(context.Background(), "lease-testhandle", "127.0.0.1:8080")
 	if err != nil {
 		t.Fatalf("factory: %v", err)
 	}

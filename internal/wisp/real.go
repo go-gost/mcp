@@ -28,18 +28,24 @@ var chainNames sync.Map
 
 // realServiceFactory wires the same service as
 //
-//	gost -L rtcp://:0/<local> -F tunnel+wss://<relay>
+//	gost -L rtcp://:0/<addr> -F tunnel+wss://<relay>
 //
 // but keeps the chain per lease: every call registers a uniquely named chain
-// and points the service at it.
+// and points the service at it. addr is already resolved and allow-listed by
+// the provisioner, so the rtcp handler never re-resolves a hostname.
 func realServiceFactory(cfg config.WispConfig) ServiceFactory {
-	return func(ctx context.Context, local string) (service.Service, error) {
-		return newRealService(ctx, cfg, local)
+	return func(ctx context.Context, name, addr string) (service.Service, error) {
+		return newRealService(ctx, cfg, name, addr)
 	}
 }
 
-func newRealService(ctx context.Context, cfg config.WispConfig, local string) (service.Service, error) {
+func newRealService(ctx context.Context, cfg config.WispConfig, name, addr string) (service.Service, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	leaseName, err := leaseName(name)
+	if err != nil {
 		return nil, err
 	}
 
@@ -50,7 +56,7 @@ func newRealService(ctx context.Context, cfg config.WispConfig, local string) (s
 
 	log := ensureLogger()
 
-	bcfg, err := cmd.BuildConfigFromCmd([]string{"rtcp://:0/" + local}, []string{relay})
+	bcfg, err := cmd.BuildConfigFromCmd([]string{"rtcp://:0/" + addr}, []string{relay})
 	if err != nil {
 		return nil, fmt.Errorf("wisp: build config: %w", err)
 	}
@@ -69,51 +75,50 @@ func newRealService(ctx context.Context, cfg config.WispConfig, local string) (s
 		return nil, errors.New("wisp: relay produced no chainer")
 	}
 
-	name, err := chainName(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := registry.ChainRegistry().Register(name, ch); err != nil {
+	if err := registry.ChainRegistry().Register(leaseName, ch); err != nil {
 		return nil, fmt.Errorf("wisp: register chain: %w", err)
 	}
 
 	svcCfg := bcfg.Services[0]
 	if svcCfg.Listener == nil {
-		registry.ChainRegistry().Unregister(name)
+		registry.ChainRegistry().Unregister(leaseName)
 		return nil, errors.New("wisp: service has no listener")
 	}
+	// BuildConfigFromCmd names every service "service-0". Overwrite it with
+	// the lease name so concurrent leases never share a service identity.
+	svcCfg.Name = leaseName
 	// BuildConfigFromCmd attaches the chain to the listener for remote
 	// protocols and to the handler otherwise; keep that placement.
 	switch svcCfg.Listener.Type {
 	case "rtcp", "rudp", "runix":
-		svcCfg.Listener.Chain = name
+		svcCfg.Listener.Chain = leaseName
 	default:
 		if svcCfg.Handler == nil {
-			registry.ChainRegistry().Unregister(name)
+			registry.ChainRegistry().Unregister(leaseName)
 			return nil, errors.New("wisp: service has no handler")
 		}
-		svcCfg.Handler.Chain = name
+		svcCfg.Handler.Chain = leaseName
 	}
 
 	svc, err := service_parser.ParseService(svcCfg)
 	if err != nil {
-		registry.ChainRegistry().Unregister(name)
+		registry.ChainRegistry().Unregister(leaseName)
 		return nil, fmt.Errorf("wisp: parse service: %w", err)
 	}
 	if svc == nil {
-		registry.ChainRegistry().Unregister(name)
+		registry.ChainRegistry().Unregister(leaseName)
 		return nil, errors.New("wisp: service parser returned nil")
 	}
 
-	chainNames.Store(svc, name)
+	chainNames.Store(svc, leaseName)
 	return svc, nil
 }
 
-// chainName returns lease-<handle>, using the handle Provision carries in the
-// context. A direct realServiceFactory call (tests) gets a fresh unique name.
-func chainName(ctx context.Context) (string, error) {
-	if handle, ok := ctx.Value(handleKey{}).(string); ok && handle != "" {
-		return "lease-" + handle, nil
+// leaseName returns name, or a fresh "lease-<handle>" for a direct
+// realServiceFactory call with no name (tests).
+func leaseName(name string) (string, error) {
+	if name != "" {
+		return name, nil
 	}
 	handle, err := newHandle()
 	if err != nil {
