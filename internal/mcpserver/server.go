@@ -7,6 +7,8 @@ package mcpserver
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -46,6 +48,13 @@ type Deps struct {
 	// the gost-mcp://leases resource is empty.
 	Wisp wisp.Provisioner
 
+	// Logger receives one structured record per successful publication and
+	// per release attempt. Defaults to a text handler on stderr, which is
+	// also the only channel available once stdout carries MCP frames. Records
+	// carry the label, target, URL, handle, and expiry, never credentials or
+	// egress node addresses.
+	Logger *slog.Logger
+
 	// Version is reported as the MCP implementation version.
 	Version string
 }
@@ -59,12 +68,28 @@ type server struct {
 	traceSem chan struct{}
 }
 
+// stderrLogger is the default publication record sink. stdout carries MCP
+// frames, so the operator's audit trail goes to stderr.
+var stderrLogger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+// logger returns the configured logger. It falls back to stderr for a server
+// constructed without New, so a publication can never panic on a nil logger.
+func (s *server) logger() *slog.Logger {
+	if s.deps.Logger != nil {
+		return s.deps.Logger
+	}
+	return stderrLogger
+}
+
 // New builds the MCP server with gost_run, gost_trace, gost_wisp,
 // gost_unwisp, and the gost-mcp://egress and gost-mcp://leases resources
 // registered.
 func New(cfg *config.Config, deps Deps) *mcp.Server {
 	if cfg == nil {
 		cfg = &config.Config{}
+	}
+	if deps.Logger == nil {
+		deps.Logger = stderrLogger
 	}
 	s := &server{
 		cfg:      cfg,

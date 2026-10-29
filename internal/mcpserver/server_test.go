@@ -1,9 +1,11 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -770,6 +772,127 @@ func TestUnwispIsIdempotent(t *testing.T) {
 	out = structured(t, second)
 	if out["ok"] != true || out["released"] != false {
 		t.Errorf("second = %v, want ok=true released=false", out)
+	}
+}
+
+func TestUnwispExpiredLeaseIsNotReleased(t *testing.T) {
+	// The provisioner retains expired records and still reports the handle as
+	// found, so Release returns true. The tool must translate that into
+	// released=false: an expired lease was already released by its TTL.
+	fake := newFakeProvisioner()
+	fake.leases["handle-exp"] = wisp.Lease{
+		Handle: "handle-exp",
+		URL:    "https://lease-exp.gost.run",
+		Local:  "127.0.0.1:3000",
+		State:  wisp.StateExpired,
+	}
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "gost_unwisp",
+		Arguments: map[string]any{"handle": "handle-exp"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool gost_unwisp: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("IsError = true, want idempotent success: %s", resultText(res))
+	}
+
+	out := structured(t, res)
+	if out["ok"] != true {
+		t.Errorf("ok = %v, want true", out["ok"])
+	}
+	if out["released"] != false {
+		t.Errorf("released = %v, want false for an expired lease", out["released"])
+	}
+	if out["url"] != "https://lease-exp.gost.run" {
+		t.Errorf("url = %v, want the expired lease's last URL", out["url"])
+	}
+}
+
+func TestWispLogsPublication(t *testing.T) {
+	fake := newFakeProvisioner()
+	var buf bytes.Buffer
+	cs := newTestSessionWith(t, testConfig(), Deps{
+		Wisp:   fake,
+		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000", "label": "demo"})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+	out := structured(t, res)
+	handle, _ := out["handle"].(string)
+	url, _ := out["url"].(string)
+	expires, _ := out["expires_at"].(string)
+
+	line := buf.String()
+	for _, want := range []string{
+		"level=INFO",
+		"label=demo",
+		"target=127.0.0.1:3000",
+		"url=" + url,
+		"handle=" + handle,
+		"expires_at=" + expires,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("publication log %q is missing %q", line, want)
+		}
+	}
+
+	// The log is a security record for the operator, not a dump of the
+	// configuration: egress credentials and node addresses must never appear.
+	for _, leak := range []string{"tokyo.example.com", "alice", "hunter2"} {
+		if strings.Contains(line, leak) {
+			t.Errorf("publication log leaks %q: %s", leak, line)
+		}
+	}
+}
+
+func TestUnwispLogsRelease(t *testing.T) {
+	fake := newFakeProvisioner()
+	var buf bytes.Buffer
+	cs := newTestSessionWith(t, testConfig(), Deps{
+		Wisp:   fake,
+		Logger: slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000"})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+	published := structured(t, res)
+	handle, _ := published["handle"].(string)
+	url, _ := published["url"].(string)
+
+	buf.Reset()
+	call := func() *mcp.CallToolResult {
+		t.Helper()
+		r, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "gost_unwisp",
+			Arguments: map[string]any{"handle": handle},
+		})
+		if err != nil {
+			t.Fatalf("CallTool gost_unwisp: %v", err)
+		}
+		return r
+	}
+
+	call()
+	line := buf.String()
+	for _, want := range []string{"level=INFO", "handle=" + handle, "url=" + url, "released=true"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("release log %q is missing %q", line, want)
+		}
+	}
+
+	buf.Reset()
+	call()
+	line = buf.String()
+	if !strings.Contains(line, "released=false") {
+		t.Errorf("second release log %q does not say released=false", line)
 	}
 }
 

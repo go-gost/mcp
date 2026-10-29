@@ -129,6 +129,16 @@ func (s *server) handleWisp(ctx context.Context, _ *mcp.CallToolRequest, in wisp
 		return nil, wispOutput{OK: false, Failure: failure.Classify(err)}, nil
 	}
 
+	// The publication record is the operator's audit trail: label, target,
+	// URL, handle, and expiry, and nothing from the egress configuration.
+	s.logger().Info("wisp: published lease",
+		"label", lease.Label,
+		"target", lease.Local,
+		"url", lease.URL,
+		"handle", lease.Handle,
+		"expires_at", lease.ExpiresAt.UTC().Format(time.RFC3339),
+	)
+
 	return nil, wispOutput{
 		OK:        true,
 		URL:       lease.URL,
@@ -153,6 +163,16 @@ func (s *server) handleUnwisp(ctx context.Context, _ *mcp.CallToolRequest, in un
 	}
 
 	lease, released := s.deps.Wisp.Release(ctx, handle)
+	// An expired lease is already gone: the provisioner retains the record for
+	// reporting and reports the handle as found, but nothing is left to revoke.
+	released = released && lease.State != wisp.StateExpired
+
+	s.logger().Info("wisp: released lease",
+		"handle", handle,
+		"url", lease.URL,
+		"released", released,
+	)
+
 	return nil, unwispOutput{OK: true, Released: released, URL: lease.URL}, nil
 }
 
