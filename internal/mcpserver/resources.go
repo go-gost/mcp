@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-gost/x/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -13,6 +14,10 @@ import (
 
 // egressResourceURI is the resource the model reads to discover profiles.
 const egressResourceURI = "gost-mcp://egress"
+
+// leasesResourceURI is the resource the model reads to find live wisp leases
+// and their current URLs.
+const leasesResourceURI = "gost-mcp://leases"
 
 // egressResource is one profile as the model sees it. Node addresses are only
 // present with --expose-topology; the default payload is name + description.
@@ -111,4 +116,60 @@ func stripUserInfo(addr string) string {
 		return authority[at+1:] + tail
 	}
 	return addr
+}
+
+// leaseResource is one live publication as the model sees it. It deliberately
+// carries no egress node addresses or credentials: the only address is the
+// local target the caller itself asked to publish.
+type leaseResource struct {
+	Handle    string `json:"handle"`
+	URL       string `json:"url"`
+	Local     string `json:"local"`
+	Label     string `json:"label"`
+	State     string `json:"state"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// addLeasesResource registers gost-mcp://leases.
+func addLeasesResource(srv *mcp.Server, s *server) {
+	srv.AddResource(&mcp.Resource{
+		URI:  leasesResourceURI,
+		Name: "leases",
+		Description: "Live wisp leases and their current public URLs, with handle, local target, label, state, and expiry (RFC3339). " +
+			"Read this after a relay re-bind because gost_wisp's returned URL may be stale. " +
+			"Each URL is public and unauthenticated. Node addresses and credentials never appear here.",
+		MIMEType: "application/json",
+	}, s.readLeasesResource)
+}
+
+// readLeasesResource renders every lease, including expired records the
+// provisioner still reports. An empty server returns [] rather than null so a
+// model can iterate without a special case.
+func (s *server) readLeasesResource(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	out := make([]leaseResource, 0)
+	if s.deps.Wisp != nil {
+		for _, l := range s.deps.Wisp.List() {
+			out = append(out, leaseResource{
+				Handle:    l.Handle,
+				URL:       l.URL,
+				Local:     l.Local,
+				Label:     l.Label,
+				State:     l.State,
+				ExpiresAt: l.ExpiresAt.UTC().Format(time.RFC3339),
+			})
+		}
+	}
+
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", leasesResourceURI, err)
+	}
+
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      leasesResourceURI,
+			MIMEType: "application/json",
+			Text:     string(data),
+		}},
+	}, nil
 }

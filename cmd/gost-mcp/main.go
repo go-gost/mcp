@@ -20,6 +20,7 @@ import (
 	"github.com/go-gost/mcp/internal/config"
 	"github.com/go-gost/mcp/internal/egress"
 	"github.com/go-gost/mcp/internal/mcpserver"
+	"github.com/go-gost/mcp/internal/wisp"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -78,6 +79,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		srv := mcpserver.New(cfg, mcpserver.Deps{
 			Egress:         reg,
 			ExposeTopology: *exposeTopology,
+			Wisp:           wisp.New(cfg.Wisp, nil),
 			Version:        version,
 		})
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-gost/mcp/internal/config"
 	"github.com/go-gost/mcp/internal/egress"
+	"github.com/go-gost/mcp/internal/wisp"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -40,6 +41,11 @@ type Deps struct {
 	// Off by default: the model sees only names and descriptions.
 	ExposeTopology bool
 
+	// Wisp publishes local services for gost_wisp. A nil provisioner is
+	// allowed: the wisp tools report that publishing is not configured and
+	// the gost-mcp://leases resource is empty.
+	Wisp wisp.Provisioner
+
 	// Version is reported as the MCP implementation version.
 	Version string
 }
@@ -53,8 +59,9 @@ type server struct {
 	traceSem chan struct{}
 }
 
-// New builds the MCP server with gost_run, gost_trace, and the
-// gost-mcp://egress resource registered.
+// New builds the MCP server with gost_run, gost_trace, gost_wisp,
+// gost_unwisp, and the gost-mcp://egress and gost-mcp://leases resources
+// registered.
 func New(cfg *config.Config, deps Deps) *mcp.Server {
 	if cfg == nil {
 		cfg = &config.Config{}
@@ -72,7 +79,10 @@ func New(cfg *config.Config, deps Deps) *mcp.Server {
 
 	mcp.AddTool(srv, runTool(), s.handleRun)
 	mcp.AddTool(srv, traceTool(), s.handleTrace)
+	mcp.AddTool(srv, wispTool(), s.handleWisp)
+	mcp.AddTool(srv, unwispTool(), s.handleUnwisp)
 	addEgressResource(srv, s)
+	addLeasesResource(srv, s)
 
 	return srv
 }

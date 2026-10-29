@@ -3,15 +3,19 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-gost/mcp/internal/config"
 	"github.com/go-gost/mcp/internal/egress"
 	"github.com/go-gost/mcp/internal/testutil"
+	"github.com/go-gost/mcp/internal/wisp"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -41,13 +45,26 @@ func testConfig() *config.Config {
 // connected client session.
 func newTestSession(t *testing.T, cfg *config.Config, exposeTopology bool) *mcp.ClientSession {
 	t.Helper()
+	return newTestSessionWith(t, cfg, Deps{ExposeTopology: exposeTopology})
+}
 
-	reg, err := egress.BuildAll(cfg.Egress)
-	if err != nil {
-		t.Fatalf("BuildAll: %v", err)
+// newTestSessionWith starts the server with explicit deps. A nil Egress is
+// built from cfg; an empty Version becomes "test".
+func newTestSessionWith(t *testing.T, cfg *config.Config, deps Deps) *mcp.ClientSession {
+	t.Helper()
+
+	if deps.Egress == nil {
+		reg, err := egress.BuildAll(cfg.Egress)
+		if err != nil {
+			t.Fatalf("BuildAll: %v", err)
+		}
+		deps.Egress = reg
+	}
+	if deps.Version == "" {
+		deps.Version = "test"
 	}
 
-	server := New(cfg, Deps{Egress: reg, ExposeTopology: exposeTopology, Version: "test"})
+	server := New(cfg, deps)
 
 	ctx := context.Background()
 	ct, st := mcp.NewInMemoryTransports()
@@ -110,6 +127,23 @@ func TestToolCatalog(t *testing.T) {
 		if !strings.Contains(strings.ToLower(tool.Description), "egress") {
 			t.Errorf("%s description does not mention egress: %q", name, tool.Description)
 		}
+	}
+
+	// The wisp tools are not egress tools, but the model must understand that a
+	// published URL is world-readable before it exposes a local service.
+	for _, name := range []string{"gost_wisp", "gost_unwisp"} {
+		if _, ok := tools[name]; !ok {
+			t.Fatalf("tool %q not listed; got %v", name, toolNames(res.Tools))
+		}
+	}
+	publish := strings.ToLower(tools["gost_wisp"].Description)
+	for _, want := range []string{"public", "unauthenticated", "authenticate"} {
+		if !strings.Contains(publish, want) {
+			t.Errorf("gost_wisp description does not mention %q: %q", want, tools["gost_wisp"].Description)
+		}
+	}
+	if !tools["gost_unwisp"].Annotations.IdempotentHint {
+		t.Errorf("gost_unwisp is not marked idempotent: %+v", tools["gost_unwisp"].Annotations)
 	}
 
 	trace := tools["gost_trace"]
@@ -482,4 +516,400 @@ func TestTraceConcurrencyCap(t *testing.T) {
 		t.Errorf("acquire after release: %v", err)
 	}
 	release2()
+}
+
+// fakeProvisioner is an in-memory wisp.Provisioner. It records every request so
+// the tool tests can assert the defaults the model did not specify, and can be
+// told to fail to exercise the structured failure path.
+type fakeProvisioner struct {
+	mu           sync.Mutex
+	leases       map[string]wisp.Lease
+	requests     []wisp.Request
+	provisionErr error
+	next         int
+}
+
+func newFakeProvisioner() *fakeProvisioner {
+	return &fakeProvisioner{leases: make(map[string]wisp.Lease)}
+}
+
+func (f *fakeProvisioner) Provision(_ context.Context, req wisp.Request) (wisp.Lease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.requests = append(f.requests, req)
+	if f.provisionErr != nil {
+		return wisp.Lease{}, f.provisionErr
+	}
+
+	f.next++
+	handle := fmt.Sprintf("handle-%d", f.next)
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	l := wisp.Lease{
+		Handle:    handle,
+		URL:       fmt.Sprintf("https://lease-%d.gost.run", f.next),
+		Local:     req.Local,
+		Label:     req.Label,
+		State:     wisp.StateActive,
+		ExpiresAt: time.Now().Add(ttl).UTC().Truncate(time.Second),
+	}
+	if req.Verify {
+		l.Verify = &wisp.VerifyResult{Checked: true, Status: http.StatusOK}
+	}
+	f.leases[handle] = l
+	return l, nil
+}
+
+func (f *fakeProvisioner) Release(_ context.Context, handle string) (wisp.Lease, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	l, ok := f.leases[handle]
+	if !ok {
+		return wisp.Lease{}, false
+	}
+	delete(f.leases, handle)
+	return l, true
+}
+
+func (f *fakeProvisioner) List() []wisp.Lease {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]wisp.Lease, 0, len(f.leases))
+	for _, l := range f.leases {
+		out = append(out, l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Handle < out[j].Handle })
+	return out
+}
+
+// lastRequest returns the most recent Provision request.
+func (f *fakeProvisioner) lastRequest(t *testing.T) wisp.Request {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.requests) == 0 {
+		t.Fatal("no provision request recorded")
+	}
+	return f.requests[len(f.requests)-1]
+}
+
+// callWisp invokes gost_wisp and fails the test on a protocol error.
+func callWisp(t *testing.T, cs *mcp.ClientSession, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost_wisp", Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool gost_wisp: %v", err)
+	}
+	return res
+}
+
+func TestWispPublishesAndReturnsHandle(t *testing.T) {
+	fake := newFakeProvisioner()
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000"})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+
+	out := structured(t, res)
+	if out["ok"] != true {
+		t.Fatalf("ok = %v, want true; failure = %v", out["ok"], out["failure"])
+	}
+	if out["state"] != wisp.StateActive {
+		t.Errorf("state = %v, want %q", out["state"], wisp.StateActive)
+	}
+	handle, _ := out["handle"].(string)
+	if handle == "" {
+		t.Errorf("handle is missing: %v", out)
+	}
+	url, _ := out["url"].(string)
+	if url == "" || !strings.Contains(url, ".gost.run") {
+		t.Errorf("url = %v, want a public wisp URL", out["url"])
+	}
+	if out["local"] != "127.0.0.1:3000" {
+		t.Errorf("local = %v, want 127.0.0.1:3000", out["local"])
+	}
+	expires, _ := out["expires_at"].(string)
+	if _, err := time.Parse(time.RFC3339, expires); err != nil {
+		t.Errorf("expires_at = %q, want RFC3339: %v", expires, err)
+	}
+	verify, ok := out["verify"].(map[string]any)
+	if !ok || verify["checked"] != true || verify["status"] != float64(http.StatusOK) {
+		t.Errorf("verify = %v, want {checked: true, status: 200}", out["verify"])
+	}
+
+	// The model omitted ttl_s and verify: the tool must supply the spec defaults.
+	req := fake.lastRequest(t)
+	if req.TTL != 900*time.Second {
+		t.Errorf("provision TTL = %v, want 15m", req.TTL)
+	}
+	if !req.Verify {
+		t.Error("provision verify = false, want the default true")
+	}
+
+	res = callWisp(t, cs, map[string]any{
+		"local":  "127.0.0.1:3001",
+		"ttl_s":  60,
+		"label":  "demo",
+		"verify": false,
+	})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+	if out := structured(t, res); out["verify"] != nil {
+		t.Errorf("verify = %v, want it omitted when disabled", out["verify"])
+	}
+
+	req = fake.lastRequest(t)
+	if req.TTL != time.Minute {
+		t.Errorf("provision TTL = %v, want 1m", req.TTL)
+	}
+	if req.Label != "demo" {
+		t.Errorf("provision label = %q, want demo", req.Label)
+	}
+	if req.Verify {
+		t.Error("provision verify = true, want false")
+	}
+}
+
+func TestWispRejectsNonLoopback(t *testing.T) {
+	// The real provisioner is used: the allow list is enforced before the
+	// service factory is reached, so no relay is contacted.
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: wisp.New(config.WispConfig{}, nil)})
+
+	res := callWisp(t, cs, map[string]any{"local": "192.0.2.1:8080"})
+	if !res.IsError {
+		t.Fatalf("IsError = false, want true; result = %v", res)
+	}
+	if msg := strings.ToLower(resultText(res)); !strings.Contains(msg, "not allowed") {
+		t.Errorf("error %q does not mention the allow list", msg)
+	}
+}
+
+func TestWispRejectsMalformedTarget(t *testing.T) {
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: wisp.New(config.WispConfig{}, nil)})
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:notaport"})
+	if !res.IsError {
+		t.Fatalf("IsError = false, want true; result = %v", res)
+	}
+	if msg := strings.ToLower(resultText(res)); !strings.Contains(msg, "invalid target") {
+		t.Errorf("error %q does not say the target is invalid", msg)
+	}
+}
+
+func TestWispPublishFailureIsStructured(t *testing.T) {
+	fake := newFakeProvisioner()
+	fake.provisionErr = fmt.Errorf("wisp: max leases reached (3)")
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000"})
+	if res.IsError {
+		t.Fatalf("IsError = true, want a structured failure: %s", resultText(res))
+	}
+
+	out := structured(t, res)
+	if out["ok"] != false {
+		t.Errorf("ok = %v, want false", out["ok"])
+	}
+	f, ok := out["failure"].(map[string]any)
+	if !ok {
+		t.Fatalf("failure = %v, want an object", out["failure"])
+	}
+	if msg, _ := f["message"].(string); !strings.Contains(msg, "max leases") {
+		t.Errorf("failure.message = %v, want the provisioner error", f["message"])
+	}
+}
+
+func TestUnwispIsIdempotent(t *testing.T) {
+	fake := newFakeProvisioner()
+	fake.leases["handle-1"] = wisp.Lease{
+		Handle: "handle-1",
+		URL:    "https://lease-1.gost.run",
+		Local:  "127.0.0.1:3000",
+		State:  wisp.StateActive,
+	}
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+
+	call := func() *mcp.CallToolResult {
+		t.Helper()
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "gost_unwisp",
+			Arguments: map[string]any{"handle": "handle-1"},
+		})
+		if err != nil {
+			t.Fatalf("CallTool gost_unwisp: %v", err)
+		}
+		return res
+	}
+
+	first := call()
+	if first.IsError {
+		t.Fatalf("first IsError = true: %s", resultText(first))
+	}
+	out := structured(t, first)
+	if out["ok"] != true || out["released"] != true {
+		t.Errorf("first = %v, want ok and released", out)
+	}
+	if out["url"] != "https://lease-1.gost.run" {
+		t.Errorf("first url = %v, want the released lease URL", out["url"])
+	}
+
+	second := call()
+	if second.IsError {
+		t.Fatalf("second IsError = true, want idempotent success: %s", resultText(second))
+	}
+	out = structured(t, second)
+	if out["ok"] != true || out["released"] != false {
+		t.Errorf("second = %v, want ok=true released=false", out)
+	}
+}
+
+func TestLeasesResource(t *testing.T) {
+	fake := newFakeProvisioner()
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: fake})
+	ctx := context.Background()
+
+	read := func() string {
+		t.Helper()
+		res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: "gost-mcp://leases"})
+		if err != nil {
+			t.Fatalf("ReadResource: %v", err)
+		}
+		if len(res.Contents) != 1 {
+			t.Fatalf("contents = %d, want 1", len(res.Contents))
+		}
+		return res.Contents[0].Text
+	}
+
+	if text := read(); text != "[]" {
+		t.Errorf("empty leases = %q, want []", text)
+	}
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000", "label": "demo"})
+	if res.IsError {
+		t.Fatalf("IsError = true: %s", resultText(res))
+	}
+	published := structured(t, res)
+
+	text := read()
+	var leases []map[string]any
+	if err := json.Unmarshal([]byte(text), &leases); err != nil {
+		t.Fatalf("resource is not JSON: %v\n%s", err, text)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("leases = %d, want 1: %s", len(leases), text)
+	}
+	lease := leases[0]
+	if lease["handle"] != published["handle"] {
+		t.Errorf("handle = %v, want %v", lease["handle"], published["handle"])
+	}
+	if lease["url"] != published["url"] {
+		t.Errorf("url = %v, want %v", lease["url"], published["url"])
+	}
+	if lease["local"] != "127.0.0.1:3000" {
+		t.Errorf("local = %v, want 127.0.0.1:3000", lease["local"])
+	}
+	if lease["label"] != "demo" {
+		t.Errorf("label = %v, want demo", lease["label"])
+	}
+	if lease["state"] != wisp.StateActive {
+		t.Errorf("state = %v, want %q", lease["state"], wisp.StateActive)
+	}
+	expires, _ := lease["expires_at"].(string)
+	if _, err := time.Parse(time.RFC3339, expires); err != nil {
+		t.Errorf("expires_at = %q, want RFC3339: %v", expires, err)
+	}
+
+	want := []string{"expires_at", "handle", "label", "local", "state", "url"}
+	var keys []string
+	for k := range lease {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if strings.Join(keys, ",") != strings.Join(want, ",") {
+		t.Errorf("lease keys = %v, want exactly %v", keys, want)
+	}
+
+	// The resource is read by a model: it must never carry egress topology or
+	// credentials.
+	for _, leak := range []string{"nodes", "tokyo.example.com", "alice", "hunter2"} {
+		if strings.Contains(text, leak) {
+			t.Errorf("resource leaks %q:\n%s", leak, text)
+		}
+	}
+}
+
+func TestWispRequiresLocal(t *testing.T) {
+	cs := newTestSessionWith(t, testConfig(), Deps{Wisp: newFakeProvisioner()})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "gost_wisp"})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("IsError = false, want true; result = %v", res)
+	}
+	// The SDK's schema validation rejects the call before the handler; either
+	// message must name the missing argument.
+	if msg := strings.ToLower(resultText(res)); !strings.Contains(msg, "local") {
+		t.Errorf("error %q does not name the missing local argument", msg)
+	}
+}
+
+func TestWispNotConfigured(t *testing.T) {
+	// A server built without a provisioner must answer, not panic.
+	cs := newTestSession(t, testConfig(), false)
+
+	res := callWisp(t, cs, map[string]any{"local": "127.0.0.1:3000"})
+	if !res.IsError {
+		t.Fatalf("IsError = false, want true; result = %v", res)
+	}
+	if msg := strings.ToLower(resultText(res)); !strings.Contains(msg, "not configured") {
+		t.Errorf("error %q does not say publishing is not configured", msg)
+	}
+
+	read, err := cs.ReadResource(context.Background(), &mcp.ReadResourceParams{URI: "gost-mcp://leases"})
+	if err != nil {
+		t.Fatalf("ReadResource: %v", err)
+	}
+	if got := read.Contents[0].Text; got != "[]" {
+		t.Errorf("leases = %q, want []", got)
+	}
+}
+
+func TestWispTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int64
+		want time.Duration
+	}{
+		{"default", 0, 900 * time.Second},
+		{"explicit", 60, time.Minute},
+		{"one second", 1, time.Second},
+		{"capped", 1_000_000, maxWispTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := wispTTL(tt.in)
+			if err != nil {
+				t.Fatalf("wispTTL(%d): %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("wispTTL(%d) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+
+	if _, err := wispTTL(-1); err == nil {
+		t.Error("wispTTL(-1) succeeded, want an argument error")
+	}
 }
