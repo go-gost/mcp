@@ -138,8 +138,9 @@ func validateProfile(p *EgressProfile, seen map[string]bool) error {
 			return err
 		}
 	} else {
+		nodeNames := make(map[string]bool)
 		for i, hop := range p.Hops {
-			if err := validateHop(p.Name, i, hop); err != nil {
+			if err := validateHop(p.Name, i, hop, nodeNames); err != nil {
 				return err
 			}
 		}
@@ -172,7 +173,9 @@ func validateChain(profile string, chain []string) error {
 	return nil
 }
 
-func validateHop(profile string, index int, hop *xconfig.HopConfig) error {
+// validateHop checks one hop. nodeNames accumulates the node names already seen
+// in this profile: names are the served_by contract, so they must be unique.
+func validateHop(profile string, index int, hop *xconfig.HopConfig, nodeNames map[string]bool) error {
 	where := fmt.Sprintf("config: egress %q: hops[%d]", profile, index)
 	if hop == nil {
 		return fmt.Errorf("%s: empty hop", where)
@@ -182,6 +185,25 @@ func validateHop(profile string, index int, hop *xconfig.HopConfig) error {
 	}
 	if err := rejectMetadata(where, hop.Metadata); err != nil {
 		return err
+	}
+	// Dynamic sources are rejected because they invalidate every static
+	// guarantee made here: the hop could load zero nodes, or different nodes,
+	// after startup and a zero-node hop truncates the chain.
+	if hop.File != nil || hop.Redis != nil || hop.HTTP != nil || hop.Plugin != nil {
+		return fmt.Errorf("%s: dynamic node sources (file, redis, http, plugin) are not allowed", where)
+	}
+	if hop.Reload != 0 {
+		return fmt.Errorf("%s: reload is not allowed (nodes must be static for the process lifetime)", where)
+	}
+	// Hop-level resolver/hosts are inherited by nodes, but the named components
+	// are never built, so resolution silently falls back to the system resolver.
+	if hop.Resolver != "" || hop.Hosts != "" {
+		return fmt.Errorf("%s: resolver and hosts are not allowed (the named components are not built)", where)
+	}
+	// A hop with no nodes makes gost stop before the following hops and return
+	// a truncated route: traffic would leave through the previous hop.
+	if len(hop.Nodes) == 0 {
+		return fmt.Errorf("%s: must have at least one node", where)
 	}
 	for j, node := range hop.Nodes {
 		if node == nil {
@@ -199,6 +221,16 @@ func validateHop(profile string, index int, hop *xconfig.HopConfig) error {
 		}
 		if err := rejectMetadata(nwhere, node.Metadata); err != nil {
 			return err
+		}
+		if strings.TrimSpace(node.Name) == "" {
+			return fmt.Errorf("%s: node name is required", nwhere)
+		}
+		if nodeNames[node.Name] {
+			return fmt.Errorf("%s: duplicate node name %q (names must be unique in a profile)", nwhere, node.Name)
+		}
+		nodeNames[node.Name] = true
+		if node.Resolver != "" || node.Hosts != "" {
+			return fmt.Errorf("%s: resolver and hosts are not allowed (the named components are not built)", nwhere)
 		}
 	}
 	return nil

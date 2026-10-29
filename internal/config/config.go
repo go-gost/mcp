@@ -102,6 +102,23 @@ func (p *EgressProfile) ChainConfig() (*xconfig.ChainConfig, error) {
 		}
 		chain := cfg.Chains[0]
 		chain.Name = p.Name
+		// BuildConfigFromCmd restarts node numbering at every hop, so a
+		// multi-hop sugar chain repeats "node-0". Names are the served_by
+		// contract and must be unique per profile, so renumber across the
+		// whole chain.
+		n := 0
+		for _, hop := range chain.Hops {
+			if hop == nil {
+				continue
+			}
+			for _, node := range hop.Nodes {
+				if node == nil {
+					continue
+				}
+				node.Name = fmt.Sprintf("node-%d", n)
+				n++
+			}
+		}
 		return chain, nil
 
 	default:

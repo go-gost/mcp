@@ -33,5 +33,8 @@ import (
 
 	// Handlers and listeners.
 	_ "github.com/go-gost/x/handler/forward/local"
+	// remote registers the rtcp/rudp/runix handlers; Task 6 publishes via
+	// rtcp, which resolves to handler type "rtcp".
+	_ "github.com/go-gost/x/handler/forward/remote"
 	_ "github.com/go-gost/x/listener/rtcp"
 )

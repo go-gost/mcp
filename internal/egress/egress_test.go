@@ -15,6 +15,7 @@ import (
 	"github.com/go-gost/mcp/internal/config"
 	"github.com/go-gost/mcp/internal/testutil"
 	xconfig "github.com/go-gost/x/config"
+	chain_parser "github.com/go-gost/x/config/parsing/chain"
 	"github.com/go-gost/x/registry"
 )
 
@@ -204,6 +205,106 @@ func TestBuildRegistersSocks5Connector(t *testing.T) {
 	}
 	if got := len(route.Nodes()); got != 1 {
 		t.Fatalf("route nodes = %d, want 1", got)
+	}
+}
+
+// TestRouteRejectsTruncatedMultiHop pins the fail-closed rule for partial
+// routes: chain.Route stops at the first hop that selects no node and returns
+// what it has, so a non-empty route can still skip the last configured hop.
+func TestRouteRejectsTruncatedMultiHop(t *testing.T) {
+	p1 := &xconfig.NodeConfig{Name: "p1", Addr: "http://127.0.0.1:8080"}
+
+	tests := []struct {
+		name      string
+		lastHop   *xconfig.HopConfig
+		lastNames map[string]struct{}
+		wantErr   bool
+	}{
+		{
+			name:      "empty last hop",
+			lastHop:   &xconfig.HopConfig{Name: "hop-1", Nodes: []*xconfig.NodeConfig{}},
+			lastNames: map[string]struct{}{},
+			wantErr:   true,
+		},
+		{
+			// ParseChain silently drops a hop reference it cannot resolve.
+			name:      "unresolved hop reference",
+			lastHop:   &xconfig.HopConfig{Name: "ghost"},
+			lastNames: map[string]struct{}{"ghost": {}},
+			wantErr:   true,
+		},
+		{
+			name:      "complete chain",
+			lastHop:   &xconfig.HopConfig{Name: "hop-1", Nodes: []*xconfig.NodeConfig{{Name: "p2", Addr: "http://127.0.0.1:8081"}}},
+			lastNames: map[string]struct{}{"p2": {}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &xconfig.ChainConfig{
+				Name: "trunc",
+				Hops: []*xconfig.HopConfig{
+					{Name: "hop-0", Nodes: []*xconfig.NodeConfig{p1}},
+					tt.lastHop,
+				},
+			}
+			c, err := chain_parser.ParseChain(cfg, defaultLogger())
+			if err != nil {
+				t.Fatalf("ParseChain: %v", err)
+			}
+
+			e := &Egress{
+				Name:         "trunc",
+				hops:         cfg.Hops,
+				hopCount:     2,
+				chain:        c,
+				lastHopNodes: tt.lastNames,
+			}
+			route, err := e.Route(context.Background(), "tcp", "example.com:80")
+			if tt.wantErr {
+				if !errors.Is(err, ErrNoRoute) {
+					t.Fatalf("Route error = %v, want ErrNoRoute", err)
+				}
+				if route != nil {
+					t.Fatalf("Route = %v, want nil", route)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Route: %v", err)
+			}
+			if got := len(route.Nodes()); got != 2 {
+				t.Fatalf("route nodes = %d, want 2", got)
+			}
+		})
+	}
+}
+
+// TestRouteDoesNotFallBackToDirect proves a denying proxy cannot be bypassed:
+// the target is reachable directly, so a successful dial would mean the egress
+// dialed around the proxy.
+func TestRouteDoesNotFallBackToDirect(t *testing.T) {
+	addr := startTarget(t)
+	proxyAddr := testutil.NewHTTPProxy(t, addr)
+
+	e, err := Build(&config.EgressProfile{
+		Name:        "via-proxy",
+		Description: "proxy denies the target",
+		Chain:       []string{"http://" + proxyAddr},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	route, err := e.Route(context.Background(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	conn, err := route.Dial(context.Background(), "tcp", addr)
+	if err == nil {
+		conn.Close()
+		t.Fatal("dial succeeded, want the proxy to deny the target; a direct dial would have bypassed the egress")
 	}
 }
 

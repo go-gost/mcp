@@ -33,6 +33,10 @@ type Egress struct {
 	chain    chain.Chainer
 	hops     []*xconfig.HopConfig
 	hopCount int
+	// lastHopNodes holds the names of the last configured hop's nodes. gost's
+	// parser preserves node names (Node.Copy copies them), so a returned route
+	// reaching the last hop contains at least one of these names.
+	lastHopNodes map[string]struct{}
 }
 
 // Build parses the profile's chain and constructs its chainer.
@@ -61,6 +65,9 @@ func Build(p *config.EgressProfile) (*Egress, error) {
 	if e.hopCount == 0 {
 		return e, nil
 	}
+	// An empty set is not "no constraint": Route treats it as unreachable, so
+	// a chain whose last hop has no usable node can never produce a route.
+	e.lastHopNodes = nodeNames(cfg.Hops[e.hopCount-1])
 
 	c, err := chain_parser.ParseChain(cfg, log)
 	if err != nil {
@@ -91,7 +98,51 @@ func (e *Egress) Route(ctx context.Context, network, address string) (chain.Rout
 	if route == nil || len(route.Nodes()) == 0 {
 		return nil, ErrNoRoute
 	}
+	// chain.Route stops at the first hop that selects no node and returns the
+	// partial route, so a non-empty route can still be truncated. The last
+	// configured hop is reached only when every hop selected a node, so require
+	// one of its nodes. len(nodes) == hopCount would not work: mux dialers split
+	// the route and chain.Route keeps only the final segment, which always
+	// contains the last hop's node.
+	if !e.reachesLastHop(route) {
+		return nil, ErrNoRoute
+	}
 	return route, nil
+}
+
+// reachesLastHop reports whether the route includes the last configured hop.
+func (e *Egress) reachesLastHop(route chain.Route) bool {
+	if len(e.lastHopNodes) == 0 {
+		return false
+	}
+	for _, node := range route.Nodes() {
+		if node == nil {
+			continue
+		}
+		if _, ok := e.lastHopNodes[node.Name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeNames returns the node names of one hop, ignoring unnamed nodes. An
+// empty result means the hop cannot be proven reachable.
+func nodeNames(hop *xconfig.HopConfig) map[string]struct{} {
+	if hop == nil {
+		return nil
+	}
+	names := make(map[string]struct{}, len(hop.Nodes))
+	for _, node := range hop.Nodes {
+		if node == nil || node.Name == "" {
+			continue
+		}
+		names[node.Name] = struct{}{}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
 }
 
 // HopCount reports how many proxy hops the egress traverses. Zero means the

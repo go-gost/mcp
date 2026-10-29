@@ -260,6 +260,130 @@ func TestValidateRejectsDroppedNamedComponents(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsEmptyHop pins the static cause of a truncated chain:
+// gost stops at a hop that selects no node, so a zero-node hop would let
+// traffic leave through the previous hop (or dial directly for hop 0).
+func TestValidateRejectsEmptyHop(t *testing.T) {
+	tests := []struct {
+		name string
+		hops []*xconfig.HopConfig
+	}{
+		{"no nodes field", []*xconfig.HopConfig{{Name: "hop-0"}}},
+		{"empty nodes", []*xconfig.HopConfig{{Name: "hop-0", Nodes: []*xconfig.NodeConfig{}}}},
+		{"second hop empty", []*xconfig.HopConfig{
+			{Name: "hop-0", Nodes: []*xconfig.NodeConfig{hopNode("a")}},
+			{Name: "hop-1"},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Egress: []EgressProfile{hopsProfile(tt.hops...)}}
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
+			}
+			if !strings.Contains(err.Error(), "node") {
+				t.Fatalf("error = %v, want it to mention the missing node", err)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsDynamicHopSource rejects hops whose node set can change
+// (or become empty) after startup: static validation cannot vouch for them.
+func TestValidateRejectsDynamicHopSource(t *testing.T) {
+	newHop := func() *xconfig.HopConfig {
+		return &xconfig.HopConfig{Name: "hop-0", Nodes: []*xconfig.NodeConfig{hopNode("n0")}}
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*xconfig.HopConfig)
+	}{
+		{"file", func(h *xconfig.HopConfig) { h.File = &xconfig.FileLoader{Path: "hops.json"} }},
+		{"redis", func(h *xconfig.HopConfig) { h.Redis = &xconfig.RedisLoader{Addr: "127.0.0.1:6379"} }},
+		{"http", func(h *xconfig.HopConfig) { h.HTTP = &xconfig.HTTPLoader{URL: "http://127.0.0.1:8000/hops"} }},
+		{"plugin", func(h *xconfig.HopConfig) { h.Plugin = &xconfig.PluginConfig{Addr: "127.0.0.1:8001"} }},
+		{"reload", func(h *xconfig.HopConfig) { h.Reload = time.Second }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHop()
+			tt.mutate(h)
+			c := &Config{Egress: []EgressProfile{hopsProfile(h)}}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsDuplicateNodeName requires stable, unique node names:
+// they are the served_by contract used to attribute an exit to a node.
+func TestValidateRejectsDuplicateNodeName(t *testing.T) {
+	tests := []struct {
+		name string
+		hops []*xconfig.HopConfig
+	}{
+		{"empty name", []*xconfig.HopConfig{{Name: "hop-0", Nodes: []*xconfig.NodeConfig{{Addr: "http://10.0.0.1:8080"}}}}},
+		{"blank name", []*xconfig.HopConfig{{Name: "hop-0", Nodes: []*xconfig.NodeConfig{{Name: " ", Addr: "http://10.0.0.1:8080"}}}}},
+		{"duplicate in one hop", []*xconfig.HopConfig{{Name: "hop-0", Nodes: []*xconfig.NodeConfig{hopNode("a"), hopNode("a")}}}},
+		{"duplicate across hops", []*xconfig.HopConfig{
+			{Name: "hop-0", Nodes: []*xconfig.NodeConfig{hopNode("a")}},
+			{Name: "hop-1", Nodes: []*xconfig.NodeConfig{hopNode("a")}},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Egress: []EgressProfile{hopsProfile(tt.hops...)}}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsNamedResolution covers hop- and node-level resolver/hosts:
+// the named components are never built, so accepting them would silently fall
+// back to system resolution.
+func TestValidateRejectsNamedResolution(t *testing.T) {
+	tests := []struct {
+		name string
+		hop  *xconfig.HopConfig
+	}{
+		{"hop.resolver", &xconfig.HopConfig{Name: "hop-0", Resolver: "r1", Nodes: []*xconfig.NodeConfig{hopNode("n0")}}},
+		{"hop.hosts", &xconfig.HopConfig{Name: "hop-0", Hosts: "h1", Nodes: []*xconfig.NodeConfig{hopNode("n0")}}},
+		{"node.resolver", &xconfig.HopConfig{Name: "hop-0", Nodes: []*xconfig.NodeConfig{{Name: "n0", Addr: "http://10.0.0.1:8080", Resolver: "r1"}}}},
+		{"node.hosts", &xconfig.HopConfig{Name: "hop-0", Nodes: []*xconfig.NodeConfig{{Name: "n0", Addr: "http://10.0.0.1:8080", Hosts: "h1"}}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{Egress: []EgressProfile{hopsProfile(tt.hop)}}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("Validate succeeded for %s, want a rejection", tt.name)
+			}
+		})
+	}
+}
+
+// hopNode returns a minimally valid, uniquely named node for validation tests.
+func hopNode(name string) *xconfig.NodeConfig {
+	return &xconfig.NodeConfig{Name: name, Addr: "http://10.0.0.1:8080"}
+}
+
+// hopsProfile returns an explicit-hops profile, overriding validProfile's sugar
+// chain.
+func hopsProfile(hops ...*xconfig.HopConfig) EgressProfile {
+	p := validProfile("corp")
+	p.Chain = nil
+	p.Hops = hops
+	return p
+}
+
 func TestValidateRejectsBadNames(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -365,8 +489,19 @@ func TestChainConfigFromSugar(t *testing.T) {
 		t.Fatalf("len(Hops) = %d, want 2", len(cfg.Hops))
 	}
 	var nodes int
+	seen := make(map[string]bool)
 	for _, h := range cfg.Hops {
 		nodes += len(h.Nodes)
+		for _, n := range h.Nodes {
+			if n.Name == "" {
+				t.Errorf("node without a name in hop %q", h.Name)
+				continue
+			}
+			if seen[n.Name] {
+				t.Errorf("duplicate node name %q across hops", n.Name)
+			}
+			seen[n.Name] = true
+		}
 	}
 	if nodes != 2 {
 		t.Errorf("node count = %d, want 2", nodes)
