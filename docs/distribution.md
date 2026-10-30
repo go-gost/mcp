@@ -43,19 +43,30 @@ docker run --rm -i \
 
 ## npm
 
+Publishing uses npm **staged publishing**: CI stages with a stage-only token,
+and a maintainer approves each version with 2FA before it goes live. This is
+npm's 2026 model for automation tokens and keeps a 2FA-capable token out of
+CI.
+
 One-time setup:
 
 1. Create the `@go-gost` organization on npmjs.com and invite the maintainers.
-2. Add an automation token as the repository secret `NPM_TOKEN`.
+2. Create a granular access token with **Read and write (stage only)** for all
+   `@go-gost` packages and add it as the repository secret `NPM_TOKEN`.
 
-Publish the packages for an existing GitHub release:
+For an existing GitHub release:
 
 1. Run the **npm-publish** workflow with `version` set to the release without
    the leading `v` (for example `0.1.0`).
 2. It downloads the release archives, stages six platform packages plus the
-   main package, and publishes the platforms first.
+   main package, and prints each stage ID.
+3. A maintainer approves every stage with 2FA, either in the npmjs.com
+   **Staged Packages** tab, or with `npm stage approve <stage-id> --otp <code>`
+   (npm >= 11.15.0, Node >= 22.14.0).
+4. Approve the platform packages before the main package, so a first
+   `npx @go-gost/mcp` finds its optional dependency.
 
-Verify:
+Verify after approval:
 
 ```sh
 npx -y @go-gost/mcp --version
