@@ -20,6 +20,11 @@ import (
 // a bare "$" is common in credentials and must survive untouched.
 var envRefPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
+// ErrNoConfig reports that the implicit search found no configuration file.
+// It is only recoverable: LoadWith substitutes an implicit direct profile when
+// the caller did not name a path explicitly.
+var ErrNoConfig = errors.New("config: no configuration file found")
+
 // LoadOptions controls LoadWith.
 type LoadOptions struct {
 	// SkipInvalid drops egress profiles that fail validation instead of
@@ -41,7 +46,25 @@ func Load(path string) (*Config, error) {
 func LoadWith(path string, opts LoadOptions) (*Config, error) {
 	c, err := loadFile(path)
 	if err != nil {
-		return nil, err
+		if path != "" || !errors.Is(err, ErrNoConfig) {
+			return nil, err
+		}
+		// No config is the normal case for a marketplace install: start with a
+		// single explicit direct profile so the tools work immediately, and let
+		// the operator add proxy profiles later.
+		if opts.Warnf != nil {
+			opts.Warnf("no configuration file found; using the implicit direct profile")
+		}
+		c = &Config{Egress: []EgressProfile{{
+			Name:        "direct",
+			Description: "Implicit direct egress (no config file)",
+			Chain:       []string{},
+		}}}
+		c.applyDefaults()
+		if err := c.Validate(); err != nil {
+			return nil, err
+		}
+		return c, nil
 	}
 	if !opts.SkipInvalid {
 		if err := c.Validate(); err != nil {
@@ -92,7 +115,7 @@ func ResolvePath(path string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("config: no configuration file found (looked in %s)", strings.Join(candidates, ", "))
+	return "", fmt.Errorf("%w (looked in %s)", ErrNoConfig, strings.Join(candidates, ", "))
 }
 
 func defaultPaths() []string {

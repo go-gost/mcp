@@ -33,6 +33,13 @@ const (
 	maxConcurrentCalls = 16
 )
 
+// Instructions is the server-wide guidance returned during initialization.
+// Clients such as Codex surface it next to the tools, so the first paragraph
+// repeats the two rules that prevent the most damaging mistakes: never treat
+// an egress name as a URI, and never publish a service without an explicit
+// request.
+const Instructions = "gost-mcp is a network toolbox with four tools. Pass gost-run and gost-trace an egress profile name from the gost-mcp://egress resource; never put a proxy URI in the egress field. Use gost-trace to find the first failing stage (resolve, connect, tls, http) instead of guessing. gost-wisp publishes a loopback HTTP service at a public, unauthenticated URL: call it only when the user explicitly asks to expose a service, keep the TTL short, and release it with gost-unwisp. A non-2xx HTTP status from gost-run is a normal result, not a failed tool call."
+
 // Deps are the runtime dependencies of the MCP server.
 type Deps struct {
 	// Egress holds the configured profiles. A nil registry is allowed and
@@ -100,7 +107,9 @@ func New(cfg *config.Config, deps Deps) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "gost-mcp",
 		Version: deps.Version,
-	}, nil)
+	}, &mcp.ServerOptions{
+		Instructions: Instructions,
+	})
 
 	mcp.AddTool(srv, runTool(), s.handleRun)
 	mcp.AddTool(srv, traceTool(), s.handleTrace)

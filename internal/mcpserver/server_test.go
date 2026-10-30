@@ -1081,3 +1081,14 @@ func TestWispTTL(t *testing.T) {
 		t.Error("wispTTL(-1) succeeded, want an argument error")
 	}
 }
+
+func TestServerAdvertisesInstructions(t *testing.T) {
+	session := newTestSession(t, testConfig(), false)
+	got := session.InitializeResult().Instructions
+	if !strings.Contains(got, "gost-mcp://egress") || !strings.Contains(got, "gost-unwisp") {
+		t.Fatalf("instructions = %q", got)
+	}
+	if len(got) > 1024 {
+		t.Fatalf("instructions too long: %d bytes", len(got))
+	}
+}

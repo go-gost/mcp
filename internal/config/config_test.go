@@ -637,3 +637,30 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
+
+func TestLoadDefaultsToDirectWithoutConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("HOME", dir)
+
+	var warnings int
+	c, err := LoadWith("", LoadOptions{Warnf: func(string, ...any) { warnings++ }})
+	if err != nil {
+		t.Fatalf("LoadWith: %v", err)
+	}
+	if len(c.Egress) != 1 || c.Egress[0].Name != "direct" {
+		t.Fatalf("Egress = %+v, want one direct profile", c.Egress)
+	}
+	if c.Egress[0].Chain == nil || len(c.Egress[0].Chain) != 0 {
+		t.Fatalf("direct Chain = %#v, want a non-nil empty chain", c.Egress[0].Chain)
+	}
+	if warnings != 1 {
+		t.Fatalf("warnings = %d, want 1", warnings)
+	}
+}
+
+func TestLoadExplicitMissingConfigStillFails(t *testing.T) {
+	if _, err := LoadWith(filepath.Join(t.TempDir(), "missing.yml"), LoadOptions{}); err == nil {
+		t.Fatal("LoadWith succeeded, want an error for an explicit missing path")
+	}
+}
