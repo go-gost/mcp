@@ -43,26 +43,35 @@ docker run --rm -i \
 
 ## npm
 
-Publishing uses npm **staged publishing**: CI stages with a stage-only token,
-and a maintainer approves each version with 2FA before it goes live. This is
-npm's 2026 model for automation tokens and keeps a 2FA-capable token out of
-CI.
+Publishing uses npm **staged publishing** with **GitHub OIDC trusted
+publishing**: CI proves its identity to npm without a stored token, stages the
+version, and a maintainer approves it with 2FA before it goes live.
 
 One-time setup:
 
 1. Create the `@go-gost` organization on npmjs.com and invite the maintainers.
-2. Create a granular access token with **Read and write (stage only)** for all
-   `@go-gost` packages and add it as the repository secret `NPM_TOKEN`.
+2. On each package page, add a trusted publisher: **Settings → Trusted
+   Publishing → GitHub Actions**, organization/user `go-gost`, repository
+   `mcp`, workflow filename `npm-publish.yml`, environment empty, and only
+   **npm stage publish** allowed. Repeat for all seven packages. A maintainer
+   can do the same from a terminal (interactive 2FA):
+   `npm trust github @go-gost/<pkg> --file npm-publish.yml --repo go-gost/mcp --allow-stage-publish`
+3. The workflow declares `id-token: write` and has no `NPM_TOKEN`.
+
+A package must already exist before npm accepts a trusted publisher for it.
+Bootstrap a brand-new package once with a stage-only token, then switch it to
+OIDC.
 
 For an existing GitHub release:
 
 1. Run the **npm-publish** workflow with `version` set to the release without
    the leading `v` (for example `0.1.0`).
-2. It downloads the release archives, stages six platform packages plus the
-   main package, and prints each stage ID.
+2. It downloads the release archives and stages six platform packages plus the
+   main package.
 3. A maintainer approves every stage with 2FA, either in the npmjs.com
    **Staged Packages** tab, or with `npm stage approve <stage-id> --otp <code>`
-   (npm >= 11.15.0, Node >= 22.14.0).
+   (npm >= 11.15.0, Node >= 22.14.0). `npm stage list <pkg>` shows the IDs; it
+   requires interactive authentication, so it cannot run in CI with OIDC.
 4. Approve the platform packages before the main package, so a first
    `npx @go-gost/mcp` finds its optional dependency.
 

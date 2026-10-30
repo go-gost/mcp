@@ -1,8 +1,9 @@
 name: npm-publish
 
-# Manual only: stages packages for maintainer approval. The token is a
-# stage-only granular token, so `npm publish` is rejected by design; 2FA
-# approval happens on npmjs.com or with `npm stage approve`.
+# Manual only: stages packages for maintainer approval. Authentication uses
+# GitHub OIDC trusted publishing, so there is no NPM_TOKEN here. Every
+# @go-gost/* package needs a trusted publisher for this repository and
+# workflow (stage-only). Approval still requires a maintainer's 2FA.
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -62,8 +64,6 @@ jobs:
         run: node npm/scripts/stage.mjs --version "${{ inputs.version }}" --binaries binaries --out stage
 
       - name: Stage platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in stage/mcp-*; do
@@ -71,16 +71,4 @@ jobs:
           done
 
       - name: Stage main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: cd stage/mcp && npm stage publish --access public
-
-      - name: Show staged packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          for dir in stage/mcp-* stage/mcp; do
-            name=$(node -p "require('./$dir/package.json').name")
-            npm stage list "$name" || true
-          done
