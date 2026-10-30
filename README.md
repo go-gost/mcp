@@ -53,7 +53,7 @@ docker run --rm -i \
 
 `-i` is required: MCP uses stdin/stdout. Do not pass `-t`; a TTY corrupts the protocol stream. The image ships `gost-mcp.example.yml` as `/etc/gost-mcp/gost-mcp.yml` (a `direct` profile only), so mount your own file over it for real egress profiles.
 
-With npm (once published; no Go toolchain or config file needed):
+With npm (no Go toolchain or config file needed):
 
 ```sh
 npx -y @go-gost/mcp
