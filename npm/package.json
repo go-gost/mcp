@@ -1,0 +1,39 @@
+{
+  "name": "@go-gost/mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing gost network primitives: HTTP through named egress profiles, staged connectivity traces, and temporary public URLs for loopback services.",
+  "license": "MIT",
+  "bin": {
+    "gost-mcp": "bin/gost-mcp.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "mcpName": "io.github.go-gost/mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/go-gost/mcp.git"
+  },
+  "homepage": "https://github.com/go-gost/mcp",
+  "bugs": {
+    "url": "https://github.com/go-gost/mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gost",
+    "proxy",
+    "tunnel"
+  ],
+  "optionalDependencies": {
+    "@go-gost/mcp-linux-x64": "0.1.0",
+    "@go-gost/mcp-linux-arm64": "0.1.0",
+    "@go-gost/mcp-darwin-x64": "0.1.0",
+    "@go-gost/mcp-darwin-arm64": "0.1.0",
+    "@go-gost/mcp-win32-x64": "0.1.0",
+    "@go-gost/mcp-win32-arm64": "0.1.0"
+  }
+}

@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # Build stage. Current stable Go image; go.mod requires Go 1.26.3 or newer, so
-# any image at or above that toolchain works.
-FROM golang:1.27 AS build
+# any image at or above that toolchain works. Build on the build host and
+# cross-compile with the TARGET* args, so a multi-arch image does not run Go
+# under QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 
 WORKDIR /src
 

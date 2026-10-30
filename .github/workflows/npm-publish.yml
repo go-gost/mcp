@@ -1,0 +1,71 @@
+name: npm-publish
+
+# Manual only: publishing needs an NPM_TOKEN secret and a version that already
+# has a GitHub release. Tag pushes must never fail because of a missing token.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v, e.g. 0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist binaries
+          gh release download "v${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'gost-mcp_*' \
+            --dir dist
+
+      - name: Unpack binaries into platform directories
+        run: |
+          set -euo pipefail
+          for archive in dist/*; do
+            name="$(basename "$archive")"
+            name="${name%.tar.gz}"; name="${name%.zip}"
+            name="${name#gost-mcp_}"
+            version="${name%%_*}"; name="${name#*_}"
+            os="${name%%_*}"; arch="${name##*_}"
+            case "$os" in windows) os=win32 ;; esac
+            case "$arch" in amd64) arch=x64 ;; esac
+            target="binaries/${os}-${arch}"
+            mkdir -p "$target"
+            case "$archive" in
+              *.zip) unzip -j -o "$archive" "gost-mcp.exe" -d "$target" ;;
+              *) tar -xzf "$archive" -C "$target" gost-mcp ;;
+            esac
+          done
+          find binaries -type f -maxdepth 2 | sort
+
+      - name: Stage packages
+        run: node npm/scripts/stage.mjs --version "${{ inputs.version }}" --binaries binaries --out stage
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in stage/mcp-*; do
+            npm publish "$dir" --access public
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish stage/mcp --access public

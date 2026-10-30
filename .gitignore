@@ -2,6 +2,10 @@
 /gost-mcp
 /dist/
 
+# npm wrapper staging
+npm/node_modules/
+npm/stage/
+
 # Test artifacts
 *.test
 coverage.out
